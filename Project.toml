@@ -1,0 +1,50 @@
+name = "NonconvexInteriorPoint"
+uuid = "f97fc732-bd95-4bcc-9f70-747c87ed59cd"
+version = "0.1.0"
+authors = ["Mohamed Tarek <mohdibntarek@gmail.com> and contributors"]
+
+[deps]
+ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
+DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+Krylov = "ba0b0d4f-ebba-5204-a429-3ac8c609bfb7"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+NonconvexCore = "035190e5-69f1-488f-aaab-becca2889735"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+
+[weakdeps]
+NonconvexSemidefinite = "9e21ff56-eb25-42d3-b86f-5b0612f555e7"
+
+[extensions]
+NonconvexInteriorPointSemidefiniteExt = "NonconvexSemidefinite"
+
+[compat]
+ADTypes = "1"
+DifferentiationInterface = "0.7"
+ForwardDiff = "0.10, 1"
+Krylov = "0.9, 0.10"
+LinearAlgebra = "1"
+NonconvexCore = "2.3"
+NonconvexIpopt = "0.9"
+NonconvexSemidefinite = "0.4, 0.5"
+Random = "1"
+Reexport = "1"
+SparseArrays = "1"
+Test = "1"
+TestItemRunner = "0.1, 0.2, 1"
+TestItems = "0.1, 1"
+Zygote = "0.6, 0.7"
+julia = "1.10"
+
+[extras]
+NonconvexIpopt = "bf347577-a06d-49ad-a669-8c0e005493b8"
+NonconvexSemidefinite = "9e21ff56-eb25-42d3-b86f-5b0612f555e7"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+TestItemRunner = "f8b46487-2199-4994-9208-9a1283c18c0a"
+TestItems = "1c621080-faea-4a02-84b6-bbd5e436b8fe"
+
+[targets]
+test = ["NonconvexIpopt", "NonconvexSemidefinite", "Test", "TestItemRunner", "TestItems"]

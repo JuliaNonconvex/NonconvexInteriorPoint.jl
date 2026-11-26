@@ -1,0 +1,35 @@
+name = "NonconvexInteriorPoint"
+modules = ["NonconvexInteriorPoint"]
+doctest_setup = "using NonconvexInteriorPoint"
+
+[[pages]]
+title = "Introduction"
+file = "index.md"
+
+[[pages]]
+title = "Quick start"
+file = "quickstart.md"
+
+[[pages]]
+title = "Options"
+file = "options.md"
+
+[[pages]]
+title = "Set constraints"
+file = "sets.md"
+
+[[pages]]
+title = "Matrix-free and trace-estimated evaluation"
+file = "matrixfree.md"
+
+[[pages]]
+title = "Result"
+file = "result.md"
+
+[[pages]]
+title = "Theory"
+file = "theory.md"
+
+[[pages]]
+title = "Docstrings"
+file = "docstrings.md"
