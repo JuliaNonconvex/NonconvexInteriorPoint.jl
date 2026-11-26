@@ -73,24 +73,23 @@ jobs:
         run: |
           if git clone --depth=1 --branch gh-pages \
               "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" /tmp/ghp; then
-            cd /tmp/ghp
+            true
           else
             # First deployment: no gh-pages branch yet — start it from an
             # orphan branch.
             git init /tmp/ghp
-            cd /tmp/ghp
-            git checkout --orphan gh-pages
-            git remote add origin \
+            git -C /tmp/ghp checkout --orphan gh-pages
+            git -C /tmp/ghp remote add origin \
               "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           fi
           rm -rf "/tmp/ghp/$DEST"
           mkdir -p "/tmp/ghp/$DEST"
           cp -r docs/build/. "/tmp/ghp/$DEST/"
           touch /tmp/ghp/.nojekyll
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet || (git commit -m "deploy: $DEST" && git push origin gh-pages)
+          git -C /tmp/ghp config user.name "github-actions[bot]"
+          git -C /tmp/ghp config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C /tmp/ghp add -A
+          git -C /tmp/ghp diff --cached --quiet || (git -C /tmp/ghp commit -m "deploy: $DEST" && git -C /tmp/ghp push origin gh-pages)
       - uses: actions/upload-pages-artifact@v3
         with:
           path: /tmp/site
