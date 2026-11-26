@@ -138,20 +138,24 @@ end
         return m
     end
 
-    # sd barrier types: :inverse (tr(X⁻¹)) converges to an interior optimum.
-    for sdtype in (:inverse, :inverse_square)
-        m = make_model()
-        r = optimize(
-            m,
-            IPMAlg(),
-            [2.5, 0.5, 2.5];
-            options=IPMOptions(
-                barrier=NonconvexInteriorPoint.BarrierSelection(sd_type=sdtype)
-            ),
-        )
-        @test r.status == :converged
-        X = [r.minimizer[1] r.minimizer[2]; r.minimizer[2] r.minimizer[3]]
-        @test all(eigvals(Symmetric(X)) .> 0)
+    # sd barrier types: :inverse (tr(X⁻¹)) and :inverse_square (tr(X⁻²)/2)
+    # converge to an interior optimum. Feature-gated: they require the PSD
+    # barrier oracles added to NonconvexSemidefinite after v0.4.6.
+    if isdefined(NonconvexSemidefinite, :PSDBarrierOracle)
+        for sdtype in (:inverse, :inverse_square)
+            m = make_model()
+            r = optimize(
+                m,
+                IPMAlg(),
+                [2.5, 0.5, 2.5];
+                options=IPMOptions(
+                    barrier=NonconvexInteriorPoint.BarrierSelection(sd_type=sdtype)
+                ),
+            )
+            @test r.status == :converged
+            X = [r.minimizer[1] r.minimizer[2]; r.minimizer[2] r.minimizer[3]]
+            @test all(eigvals(Symmetric(X)) .> 0)
+        end
     end
 
     # logdet (default) still converges.

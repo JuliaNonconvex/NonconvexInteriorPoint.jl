@@ -126,6 +126,28 @@ regime (so line searches reject infeasible points); infeasible starts use a
 smooth C¹ extension of the log barrier.
 """
 function barrier_objective(m::IPMModel, x::AbstractVector, mu::Float64, opts::IPMOptions)
+    φ = _scalar_barrier_objective(m, x, mu, opts)
+    isfinite(φ) || return φ
+    sel = opts.barrier
+    for (k, (c, set, mode)) in enumerate(m.setcons)
+        bv = sd_barrier_value_c(
+            c, set, x, Val(_eff_mode(mode, mu, opts)), sel.sd_type, opts
+        )
+        isfinite(bv) || return Inf
+        φ += mu * bv
+    end
+    return φ
+end
+
+# The scalar part of the barrier objective (objective, relaxed penalties,
+# inequality and bound barriers — no set barriers). Non-mutating and
+# AD-differentiable: used for the Hessian(-vector) products of the KKT
+# operators, which add the set-barrier Hessian products through the
+# analytic oracle hooks instead of differentiating the (possibly
+# matrix-free or trace-estimated) set-barrier values.
+function _scalar_barrier_objective(
+    m::IPMModel, x::AbstractVector, mu::Float64, opts::IPMOptions
+)
     f = _aug_objective(m, x)
     isfinite(f) || return Inf
     sel = opts.barrier
@@ -183,13 +205,6 @@ function barrier_objective(m::IPMModel, x::AbstractVector, mu::Float64, opts::IP
                 end
             end
         end
-    end
-    for (k, (c, set, mode)) in enumerate(m.setcons)
-        bv = sd_barrier_value_c(
-            c, set, x, Val(_eff_mode(mode, mu, opts)), sel.sd_type, opts
-        )
-        isfinite(bv) || return Inf
-        φ += mu * bv
     end
     return φ
 end
@@ -506,8 +521,19 @@ function LinearAlgebra.mul!(y, op::KKTLinearOp, u)
     dλ = view(u, (n + 1):(n + mE))
     yx = view(y, 1:n)
     yλ = view(y, (n + 1):(n + mE))
-    # (1,1): Hessian of the barrier objective times dx
-    hvp!(yx, _barrier_closure(m, st.mu, op.opts), st.x, dx)
+    # (1,1): Hessian of the barrier objective times dx — the scalar part
+    # (objective, relaxed penalties, inequality/bound barriers) through AD,
+    # the set barriers through the analytic oracle Hessian products (their
+    # matrix-free/trace-estimated values are not AD-differentiable)
+    hvp!(yx, z -> _scalar_barrier_objective(m, z, st.mu, op.opts), st.x, dx)
+    for (k, (c, set, mode)) in enumerate(m.setcons)
+        effm = _eff_mode(mode, st.mu, op.opts)
+        bar = similar(yx)
+        sd_barrier_hess_x_prod!(
+            bar, c, set, st.x, dx, Val(effm), op.opts.barrier.sd_type, op.opts
+        )
+        yx .+= st.mu .* bar
+    end
     yx .+= op.δw .* dx
     # (1,2): J_E' dλ
     offset = 1

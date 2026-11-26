@@ -69,33 +69,50 @@ end
     ]
     @test maximum(abs, g) <= 1e-3
 
-    # matrix-free oracle (label-selected)
-    m = make_model(; flags=Set([:matrixfree]))
-    r = optimize(m, IPMAlg(), [2.5, 0.5, 2.5])
-    @test r.status == :converged
-    X = [r.minimizer[1] r.minimizer[2]; r.minimizer[2] r.minimizer[3]]
-    @test all(eigvals(Symmetric(X)) .> 0)
+    # matrix-free and trace-estimated oracles (label-selected): the
+    # :matrixfree/:trace flags must be activated through the evaluation
+    # selection to take effect. Feature-gated: the oracles were added to
+    # NonconvexSemidefinite after v0.4.6.
+    if isdefined(NonconvexSemidefinite, :PSDBarrierOracle)
+        m = make_model(; flags=Set([:matrixfree]))
+        r = optimize(
+            m,
+            IPMAlg(),
+            [2.5, 0.5, 2.5];
+            options=IPMOptions(
+                evaluation=NonconvexInteriorPoint.IPMEvaluationSelection(
+                    matrixfree_all=true
+                ),
+            ),
+        )
+        @test r.status == :converged
+        X = [r.minimizer[1] r.minimizer[2]; r.minimizer[2] r.minimizer[3]]
+        @test all(eigvals(Symmetric(X)) .> 0)
 
-    # trace-estimated oracle (label-selected, randomized)
-    m = make_model(; flags=Set([:trace]))
-    r = optimize(
-        m,
-        IPMAlg(),
-        [2.5, 0.5, 2.5];
-        options=IPMOptions(
-            trace_nprobes=20, trace_lanczos_deg=20, rng=Random.MersenneTwister(7)
-        ),
-    )
-    @test r.status == :converged
-    X = [r.minimizer[1] r.minimizer[2]; r.minimizer[2] r.minimizer[3]]
-    @test all(eigvals(Symmetric(X)) .> 0)
-    Xinv = inv(X)
-    g = [
-        -Xinv[1, 1] + (r.minimizer[1] - 2.0),
-        -2Xinv[1, 2] + (r.minimizer[2] - 0.5),
-        -Xinv[2, 2] + (r.minimizer[3] - 2.0),
-    ]
-    @test maximum(abs, g) <= 1e-2
+        # trace-estimated oracle (label-selected, randomized)
+        m = make_model(; flags=Set([:trace]))
+        r = optimize(
+            m,
+            IPMAlg(),
+            [2.5, 0.5, 2.5];
+            options=IPMOptions(
+                evaluation=NonconvexInteriorPoint.IPMEvaluationSelection(trace_all=true),
+                trace_nprobes=20,
+                trace_lanczos_deg=20,
+                rng=Random.MersenneTwister(7),
+            ),
+        )
+        @test r.status == :converged
+        X = [r.minimizer[1] r.minimizer[2]; r.minimizer[2] r.minimizer[3]]
+        @test all(eigvals(Symmetric(X)) .> 0)
+        Xinv = inv(X)
+        g = [
+            -Xinv[1, 1] + (r.minimizer[1] - 2.0),
+            -2Xinv[1, 2] + (r.minimizer[2] - 0.5),
+            -Xinv[2, 2] + (r.minimizer[3] - 2.0),
+        ]
+        @test maximum(abs, g) <= 1e-2
+    end
 
     # Unsupported barrier modes throw an informative error
     @test_throws ArgumentError NonconvexInteriorPoint._psd_barrier(

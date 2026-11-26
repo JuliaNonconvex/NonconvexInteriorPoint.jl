@@ -12,25 +12,36 @@
 
 # NonconvexInteriorPoint.jl
 
-A native interior-point method for smooth, generally nonconvex nonlinear programs with exotic constraint types.
+A native interior-point method for smooth, generally nonconvex nonlinear programs, with per-constraint customizability throughout.
 
-`NonconvexInteriorPoint.jl` provides [`IPMAlg`](@ref), a native primal
+`NonconvexInteriorPoint.jl` provides `IPMAlg`, a native primal
 barrier interior-point solver in the spirit of Ipopt, MadNLP and Uno:
 regularized (inertia-corrected) KKT solves — dense or matrix-free with
 Krylov methods —, backtracking on an exact-penalty merit, an adaptive
-barrier update, native linear constraints, and — through NonconvexCore's
-set constraints — generalized inequalities including semidefinite cones.
+barrier update, and native linear constraints.
+
+Almost every ingredient is selectable **per constraint** through
+NonconvexCore's label (`flags`) mechanism:
+
+- **Which constraints enter the barrier, and with which barrier type**
+  (`BarrierSelection`): scalar barriers `-ln t`, `1/t`, `1/(2t²)`
+  for inequalities and bounds, `-log det X`, `tr(X⁻¹)`, `tr(X⁻²)/2` for
+  semidefinite cones, and per-label exclusion (excluded inequalities become
+  hard slacked constraints).
+- **How each constraint is evaluated**
+  (`IPMEvaluationSelection`): dense, matrix-free (implicit
+  products, iterative solves — no dense assembly), or trace-estimated
+  (randomized Hutchinson, Hutch++, stochastic Lanczos quadrature, rational,
+  Taylor, and low-rank log-determinant estimators), enabling large sparse
+  SDP-constrained problems (buckling-type) without materializing dense
+  matrices.
+- **Global switches**: `slacks = true` for the Ipopt-style slacked
+  formulation, and `inner = alg` to delegate the barrier subproblems to
+  any NonconvexCore optimizer (the built-in Newton solver is the default).
+
 Inequalities and set constraints enter the barrier with adjoint-only
-gradients; a `slacks = true` option switches to the Ipopt-style slacked
-formulation; an optional inner optimizer can solve the barrier
-subproblems; and the scalar/semidefinite barrier types are selectable
-per constraint ([`BarrierSelection`]). Evaluation of each constraint can
-be selected per constraint via labels: dense, matrix-free, or
-trace-estimated (randomized Hutchinson, Hutch++, stochastic Lanczos
-quadrature, rational, Taylor, and low-rank log-determinant estimators),
-enabling large sparse SDP-constrained problems (buckling-type) without
-materializing dense matrices. The design is documented in
-[DESIGN.md](DESIGN.md).
+gradients (no Jacobians are materialized for them). The design is
+documented in [DESIGN.md](DESIGN.md).
 
 `NonconvexInteriorPoint.jl` is part of the JuliaNonconvex ecosystem built on
 NonconvexCore.jl under the Nonconvex.jl umbrella.

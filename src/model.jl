@@ -243,11 +243,12 @@ function _convert_set_rec!(out, c, f, set)
 end
 
 # Jacobian-constancy probe: detect (numerically) linear constraints so their
-# Jacobians can be cached once.
+# Jacobians can be cached once. The perturbation is deterministic (no RNG:
+# the user's rng in IPMOptions is reserved for the trace estimators, whose
+# probe draws must not be disturbed by model construction).
 function _probe_linear(c, x0)
     v0, J0 = value_jacobian(c, x0)
-    rng = Random.MersenneTwister(42)
-    Δ = randn(rng, length(x0)) .* 1e-3
+    Δ = 1e-3 .* sin.(1.0:length(x0))
     v1, J1 = value_jacobian(c, x0 .+ Δ)
     b = _vec(v0) .- J0 * x0
     if isapprox(J0, J1; rtol=1e-6, atol=1e-8) &&
