@@ -2,7 +2,7 @@
 # JET report script used by the JET workflow. Produces a JSON summary.
 using JET
 using JSON
-import NonconvexInteriorPoint
+using NonconvexInteriorPoint: NonconvexInteriorPoint
 
 function main()
     output = nothing
@@ -54,8 +54,8 @@ function main()
         "warnings" => 0,
         "filtered_dependency_issues" => 0,
         "issues" => [
-            Dict("type" => "report", "signature" => "", "message" => first(txt, 500)) for
-            txt in issues[1:min(end, 20)]
+            Dict("type" => "report", "signature" => "", "message" => first(txt, 500))
+            for txt in issues[1:min(end, 20)]
         ],
     )
     if output === nothing
