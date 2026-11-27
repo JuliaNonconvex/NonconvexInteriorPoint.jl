@@ -60,6 +60,10 @@ mutable struct IPMModel
     # points again (the smooth extension is only for infeasible starts)
     strict::Base.RefValue{Bool}
     counter::Base.RefValue{Int}
+    # The shared MathOptInterface evaluator of a JuMP-converted model
+    # (nothing otherwise): values, Jacobians and Lagrangian Hessians are
+    # read from it directly — the evaluator cannot be traced by AD.
+    jump::Union{Nothing,NonconvexCore.JuMPEvaluator}
 end
 
 mE(m::IPMModel) = n_eq_nl(m) + n_eq_lin(m)
@@ -264,9 +268,21 @@ end
 Convert the `VecModel` `m` into the interior-point [`IPMModel`](@ref) form.
 """
 function build_ipm_model(m::AbstractModel, opts::IPMOptions)
+    # A JuMP-converted model keeps its constraints in one shared MOI
+    # evaluator: the linear-constancy probe must not split its rows (the
+    # evaluator already handles affine rows in closed form).
+    jump = NonconvexCore.jump_evaluator(m)
     n = length(getmin(m))
     xl = Float64.(getmin(m))
     xu = Float64.(getmax(m))
+    # Unbounded variables get pseudo-bounds (Ipopt-style bound push): every
+    # variable then carries bound-barrier curvature, so the barrier Hessian
+    # has no structural null directions.
+    x0v = Float64.(getinit(m))
+    @inbounds for i in 1:n
+        isfinite(xl[i]) || (xl[i] = -1e4 * (1 + abs(x0v[i])))
+        isfinite(xu[i]) || (xu[i] = 1e4 * (1 + abs(x0v[i])))
+    end
     x0 = Float64.(getinit(m))
     counter = Ref(0)
 
@@ -305,7 +321,7 @@ function build_ipm_model(m::AbstractModel, opts::IPMOptions)
             push!(lin_eq_parts, (A, _vec(c.rhs) .- b))
             continue
         end
-        if opts.linear_constraints
+        if opts.linear_constraints && jump === nothing
             probed = _probe_linear(c, x0)
             if probed !== nothing
                 J0, b = probed
@@ -333,7 +349,7 @@ function build_ipm_model(m::AbstractModel, opts::IPMOptions)
             push!(lin_ineq_barrier_parts, in_bar)
             continue
         end
-        if opts.linear_constraints
+        if opts.linear_constraints && jump === nothing
             probed = _probe_linear(c, x0)
             if probed !== nothing
                 J0, b = probed
@@ -437,6 +453,7 @@ function build_ipm_model(m::AbstractModel, opts::IPMOptions)
         Float64(opts.relaxed_penalty_rho),
         Ref(false),
         counter,
+        jump,
     )
 end
 

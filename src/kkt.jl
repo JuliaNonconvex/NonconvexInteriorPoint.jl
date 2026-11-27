@@ -326,6 +326,9 @@ closure is differentiated there instead (also reverse-mode).
 function barrier_gradient!(
     g::AbstractVector, m::IPMModel, x::AbstractVector, mu::Float64, opts::IPMOptions
 )
+    if m.jump !== nothing
+        return _jump_barrier_gradient!(g, m, x, mu, opts)
+    end
     # objective part (pullback-based scalar differentiation)
     _, gobj = value_gradient(_aug_obj_closure(m), x)
     gobj === nothing ? fill!(g, 0.0) : copyto!(g, gobj)
@@ -398,10 +401,14 @@ function assemble_kkt_dense!(
     N = n + mE
     fill!(st.K, 0.0)
     m.counter[] += 2 * (length(m.nleqs) + length(m.nlineqs) + length(m.setcons))
-    H = try
-        value_hessian(_barrier_closure(m, st.mu, opts), st.x)
-    catch
-        zeros(n, n)
+    H = if m.jump !== nothing
+        _jump_barrier_hessian!(zeros(n, n), m, st.x, st.mu, opts)
+    else
+        try
+            value_hessian(_barrier_closure(m, st.mu, opts), st.x)
+        catch
+            zeros(n, n)
+        end
     end
     K11 = view(st.K, 1:n, 1:n)
     copyto!(K11, H)
@@ -460,6 +467,10 @@ function solve_kkt_dense!(st::IPMState, m::IPMModel, opts::IPMOptions; δc0::Flo
     end
     δc = 1e-4
     δw = 1e-8
+    # Minimum acceptable curvature: the barrier Hessian can have structural
+    # null directions (variables without objective or barrier curvature at
+    # the current active set); they must be regularized, not amplified.
+    _kkt_min_curv = 1e-10
     for trial in 1:12
         assemble_kkt_dense!(st, m, opts, δw, δc)
         E = eigen(Symmetric(st.K))
@@ -525,7 +536,11 @@ function LinearAlgebra.mul!(y, op::KKTLinearOp, u)
     # (objective, relaxed penalties, inequality/bound barriers) through AD,
     # the set barriers through the analytic oracle Hessian products (their
     # matrix-free/trace-estimated values are not AD-differentiable)
-    hvp!(yx, z -> _scalar_barrier_objective(m, z, st.mu, op.opts), st.x, dx)
+    if m.jump !== nothing
+        _jump_barrier_hessprod!(yx, m, st.x, dx, st.mu, op.opts)
+    else
+        hvp!(yx, z -> _scalar_barrier_objective(m, z, st.mu, op.opts), st.x, dx)
+    end
     for (k, (c, set, mode)) in enumerate(m.setcons)
         effm = _eff_mode(mode, st.mu, op.opts)
         bar = similar(yx)
@@ -537,26 +552,36 @@ function LinearAlgebra.mul!(y, op::KKTLinearOp, u)
     yx .+= op.δw .* dx
     # (1,2): J_E' dλ
     offset = 1
-    for (k, c) in enumerate(m.nleqs)
-        d = getdim(c)
-        jtprod!(yx, c, st.x, view(dλ, offset:(offset + d - 1)))
-        offset += d
-    end
-    if m.linAeq !== nothing
-        mul!(yx, m.linAeq', view(dλ, offset:(offset + size(m.linAeq, 1) - 1)), 1.0, 1.0)
-        offset += size(m.linAeq, 1)
+    if m.jump !== nothing
+        Jeq = _jump_eq_jacobian(m, st.x)
+        mul!(yx, Jeq', dλ, 1.0, 1.0)
+    else
+        for (k, c) in enumerate(m.nleqs)
+            d = getdim(c)
+            jtprod!(yx, c, st.x, view(dλ, offset:(offset + d - 1)))
+            offset += d
+        end
+        if m.linAeq !== nothing
+            mul!(yx, m.linAeq', view(dλ, offset:(offset + size(m.linAeq, 1) - 1)), 1.0, 1.0)
+            offset += size(m.linAeq, 1)
+        end
     end
     # (2,1): J_E dx
     offset = 1
-    for (k, c) in enumerate(m.nleqs)
-        d = getdim(c)
-        v = jacprod(c, st.x, dx)
-        yλ[offset:(offset + d - 1)] .= v
-        offset += d
-    end
-    if m.linAeq !== nothing
-        mul!(view(yλ, offset:(offset + size(m.linAeq, 1) - 1)), m.linAeq, dx)
-        offset += size(m.linAeq, 1)
+    if m.jump !== nothing
+        Jeq = _jump_eq_jacobian(m, st.x)
+        mul!(yλ, Jeq, dx)
+    else
+        for (k, c) in enumerate(m.nleqs)
+            d = getdim(c)
+            v = jacprod(c, st.x, dx)
+            yλ[offset:(offset + d - 1)] .= v
+            offset += d
+        end
+        if m.linAeq !== nothing
+            mul!(view(yλ, offset:(offset + size(m.linAeq, 1) - 1)), m.linAeq, dx)
+            offset += size(m.linAeq, 1)
+        end
     end
     # (2,2)
     @inbounds for i in 1:mE

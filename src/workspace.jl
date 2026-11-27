@@ -108,6 +108,9 @@ end
 # Transposed-equality-Jacobian-times-multipliers (for the stationarity
 # residual g + J_E' λE).
 function _jteq_λ!(r::AbstractVector, m::IPMModel, x::AbstractVector, lamE::AbstractVector)
+    if m.jump !== nothing
+        return _jump_jteq_λ!(r, m, x, lamE)
+    end
     offset = 1
     for (k, c) in enumerate(m.nleqs)
         d = getdim(c)
@@ -417,7 +420,13 @@ Base.size(op::ViolationHessianOp, d::Int) = size(op)[d]
 Base.eltype(::ViolationHessianOp) = Float64
 function LinearAlgebra.mul!(y, op::ViolationHessianOp, u)
     fill!(y, 0.0)
-    hvp!(y, op.f, op.x, u)
+    if op.f isa IPMModel
+        # JuMP-converted model: the violation Hessian product comes from the
+        # evaluator (the closure over the evaluator cannot be AD-traced)
+        _jump_violation_hessprod!(y, op.f, op.x, u)
+    else
+        hvp!(y, op.f, op.x, u)
+    end
     y .+= op.δ .* u
     return y
 end
@@ -436,15 +445,32 @@ function _feasibility_stage!(m::IPMModel, x::Vector{Float64}, opts::IPMOptions)
     xt = similar(x)
     g = similar(x)
     dx = similar(x)
+    restarts = 0
     for iter in 1:opts.feasibility_max_iter
         m.counter[] += 1 + length(m.nlineqs) + length(m.nleqs)
-        _, gr = value_gradient(f!, x)
-        gr === nothing && return nothing
-        copyto!(g, gr)
+        if m.jump !== nothing
+            _jump_violation_gradient!(g, m, x)
+        else
+            _, gr = value_gradient(f!, x)
+            gr === nothing && return nothing
+            copyto!(g, gr)
+        end
         # regularized Newton direction: (H + δI) dx = -g
         δ = 1e-10
         solved = false
-        for _ in 1:6
+        if m.jump !== nothing
+            # the violation Hessian product of a JuMP-converted model comes
+            # from the evaluator (no AD through the closure)
+            jop = ViolationHessianOp(m, x, δ, m.n)
+            sol, stats = Krylov.minres(
+                jop, .-g; rtol=1e-8, atol=1e-12, itmax=max(2 * m.n, 100), verbose=0
+            )
+            if stats.solved
+                copyto!(dx, sol)
+                solved = true
+            end
+        end
+        for _ in 1:(solved ? 0 : 6)
             op = ViolationHessianOp(f!, x, δ, m.n)
             sol, stats = Krylov.minres(
                 op, .-g; rtol=1e-8, atol=1e-12, itmax=max(2 * m.n, 100), verbose=0
@@ -472,7 +498,17 @@ function _feasibility_stage!(m::IPMModel, x::Vector{Float64}, opts::IPMOptions)
             end
             α *= 0.5
         end
-        accepted || return nothing
+        if !accepted
+            # Stationary point of the violation measure (e.g. a symmetric
+            # saddle of a flat start) with residual violation: break the
+            # symmetry with a deterministic perturbation and keep going.
+            restarts += 1
+            restarts > 5 && return nothing
+            @inbounds for i in 1:m.n
+                x[i] += 1e-3 * (1 + abs(x[i])) * sin(1.7 * i + 2.3 * restarts)
+            end
+            continue
+        end
         x .+= α .* dx
         f!(x) <= 1e-12 && return nothing # all margins (1e-2) met
     end

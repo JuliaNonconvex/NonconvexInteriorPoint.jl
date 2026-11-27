@@ -159,6 +159,9 @@ function slacked_barrier_gradient!(
     mu::Float64,
     opts::IPMOptions,
 )
+    if m.jump !== nothing
+        return _jump_barrier_gradient!(g, m, x, mu, opts)
+    end
     _, gobj = value_gradient(_aug_obj_closure(m), x)
     gobj === nothing ? fill!(g, 0.0) : copyto!(g, gobj)
     sel = opts.barrier
@@ -349,10 +352,14 @@ function assemble_slacked_kkt!(
     fill!(st.K, 0.0)
     # (1,1): Lagrangian Hessian (slacked constraints) + set barrier Hessians +
     # bound barrier diagonal + δw I
-    H = try
-        value_hessian(_slacked_lagrangian(m, st.lamE, st.lamI), st.x)
-    catch
-        zeros(n, n)
+    H = if m.jump !== nothing
+        _jump_slacked_lagrangian_hessian!(zeros(n, n), m, st.x, st.lamE, st.lamI)
+    else
+        try
+            value_hessian(_slacked_lagrangian(m, st.lamE, st.lamI), st.x)
+        catch
+            zeros(n, n)
+        end
     end
     for (k, (c, set, mode)) in enumerate(m.setcons)
         Hh = similar(H)
@@ -516,23 +523,34 @@ function _ipm_solve_slacked!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
         )
         rstat = copy(st.gf)
         _jteq_λ!(rstat, m, st.x, st.lamE)
-        for (k, c) in enumerate(m.nlineqs)
-            m.nlineq_barrier[k] && continue
-            d = getdim(c)
-            jtprod!(
-                rstat,
-                c,
-                st.x,
-                view(st.lamI, _lamI_offset(m, k):(_lamI_offset(m, k) + d - 1)),
-            )
-        end
-        if m.linAineq !== nothing && any(.!m.lin_ineq_barrier)
-            mask = m.lin_ineq_barrier
-            n_nl_sl = sum(
-                getdim(c) for (c, b) in zip(m.nlineqs, m.nlineq_barrier) if !b; init=0
-            )
-            As = m.linAineq[.!mask, :]
-            mul!(rstat, As', view(st.lamI, (n_nl_sl + 1):(n_nl_sl + size(As, 1))), 1.0, 1.0)
+        if m.jump !== nothing
+            Jsl = _jump_slacked_jacobian(m, st.x)
+            mul!(rstat, Jsl', [st.lamI; st.lamE], 1.0, 1.0)
+        else
+            for (k, c) in enumerate(m.nlineqs)
+                m.nlineq_barrier[k] && continue
+                d = getdim(c)
+                jtprod!(
+                    rstat,
+                    c,
+                    st.x,
+                    view(st.lamI, _lamI_offset(m, k):(_lamI_offset(m, k) + d - 1)),
+                )
+            end
+            if m.linAineq !== nothing && any(.!m.lin_ineq_barrier)
+                mask = m.lin_ineq_barrier
+                n_nl_sl = sum(
+                    getdim(c) for (c, b) in zip(m.nlineqs, m.nlineq_barrier) if !b; init=0
+                )
+                As = m.linAineq[.!mask, :]
+                mul!(
+                    rstat,
+                    As',
+                    view(st.lamI, (n_nl_sl + 1):(n_nl_sl + size(As, 1))),
+                    1.0,
+                    1.0,
+                )
+            end
         end
         dual_inf = isempty(rstat) ? 0.0 : maximum(abs, rstat)
         s_dual_inf = isempty(st.lamI) ? 0.0 : maximum(abs, st.lamI .- st.mu ./ st.s)
@@ -696,7 +714,11 @@ function LinearAlgebra.mul!(y, op::SlackedKKTOp, u)
     yx = view(y, 1:n)
     yλ = view(y, (n + 1):(n + mE + mI))
     # (1,1)
-    hvp!(yx, _slacked_lagrangian(m, st.lamE, st.lamI), st.x, dx)
+    if m.jump !== nothing
+        _jump_slacked_lagrangian_hessprod!(yx, m, st.x, dx, st.lamE, st.lamI)
+    else
+        hvp!(yx, _slacked_lagrangian(m, st.lamE, st.lamI), st.x, dx)
+    end
     for (k, (c, set, mode)) in enumerate(m.setcons)
         effm = _eff_mode(mode, st.mu, op.opts)
         bar = similar(yx)
@@ -710,20 +732,25 @@ function LinearAlgebra.mul!(y, op::SlackedKKTOp, u)
     end
     # (1,2): J' dλ (eq rows + slacked ineq rows)
     offset = 1
-    for (k, c) in enumerate(m.nleqs)
-        d = getdim(c)
-        jtprod!(yx, c, st.x, view(dλ, offset:(offset + d - 1)))
-        offset += d
-    end
-    if m.linAeq !== nothing
-        mul!(yx, m.linAeq', view(dλ, offset:(offset + size(m.linAeq, 1) - 1)), 1.0, 1.0)
-        offset += size(m.linAeq, 1)
-    end
-    for (k, c) in enumerate(m.nlineqs)
-        m.nlineq_barrier[k] && continue
-        d = getdim(c)
-        jtprod!(yx, c, st.x, view(dλ, offset:(offset + d - 1)))
-        offset += d
+    if m.jump !== nothing
+        Jsl = _jump_slacked_jacobian(m, st.x)
+        mul!(yx, Jsl', dλ, 1.0, 1.0)
+    else
+        for (k, c) in enumerate(m.nleqs)
+            d = getdim(c)
+            jtprod!(yx, c, st.x, view(dλ, offset:(offset + d - 1)))
+            offset += d
+        end
+        if m.linAeq !== nothing
+            mul!(yx, m.linAeq', view(dλ, offset:(offset + size(m.linAeq, 1) - 1)), 1.0, 1.0)
+            offset += size(m.linAeq, 1)
+        end
+        for (k, c) in enumerate(m.nlineqs)
+            m.nlineq_barrier[k] && continue
+            d = getdim(c)
+            jtprod!(yx, c, st.x, view(dλ, offset:(offset + d - 1)))
+            offset += d
+        end
     end
     if m.linAineq !== nothing && any(.!m.lin_ineq_barrier)
         mask = m.lin_ineq_barrier
@@ -733,22 +760,27 @@ function LinearAlgebra.mul!(y, op::SlackedKKTOp, u)
     end
     # (2,1): J dx
     offset = 1
-    for (k, c) in enumerate(m.nleqs)
-        d = getdim(c)
-        v = jacprod(c, st.x, dx)
-        yλ[offset:(offset + d - 1)] .= v
-        offset += d
-    end
-    if m.linAeq !== nothing
-        mul!(view(yλ, offset:(offset + size(m.linAeq, 1) - 1)), m.linAeq, dx)
-        offset += size(m.linAeq, 1)
-    end
-    for (k, c) in enumerate(m.nlineqs)
-        m.nlineq_barrier[k] && continue
-        d = getdim(c)
-        v = jacprod(c, st.x, dx)
-        yλ[offset:(offset + d - 1)] .= v
-        offset += d
+    if m.jump !== nothing
+        Jsl = _jump_slacked_jacobian(m, st.x)
+        mul!(yλ, Jsl, dx)
+    else
+        for (k, c) in enumerate(m.nleqs)
+            d = getdim(c)
+            v = jacprod(c, st.x, dx)
+            yλ[offset:(offset + d - 1)] .= v
+            offset += d
+        end
+        if m.linAeq !== nothing
+            mul!(view(yλ, offset:(offset + size(m.linAeq, 1) - 1)), m.linAeq, dx)
+            offset += size(m.linAeq, 1)
+        end
+        for (k, c) in enumerate(m.nlineqs)
+            m.nlineq_barrier[k] && continue
+            d = getdim(c)
+            v = jacprod(c, st.x, dx)
+            yλ[offset:(offset + d - 1)] .= v
+            offset += d
+        end
     end
     if m.linAineq !== nothing && any(.!m.lin_ineq_barrier)
         mask = m.lin_ineq_barrier
