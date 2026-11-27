@@ -34,7 +34,8 @@ See [Quick start](quickstart.md) for the first steps, [Options](options.md) for
 the full option reference, [Set constraints](sets.md) for barrier oracles,
 [Matrix-free and trace-estimated evaluation](matrixfree.md) for the
 per-constraint evaluation modes, [Result](result.md) for the returned result
-fields, [Theory](theory.md) for the algorithmic background and
+fields, [Theory](theory.md) for the algorithmic background, the
+[buckling-constrained example](buckling.md) for a worked nonconvex SDP, and
 [Docstrings](docstrings.md) for the API reference.
 
 ## Design influences

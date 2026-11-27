@@ -31,5 +31,9 @@ title = "Theory"
 file = "theory.md"
 
 [[pages]]
+title = "A buckling-constrained example"
+file = "buckling.md"
+
+[[pages]]
 title = "Docstrings"
 file = "docstrings.md"
