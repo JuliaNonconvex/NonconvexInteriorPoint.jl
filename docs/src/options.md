@@ -18,6 +18,10 @@ r = optimize(m, IPMAlg(), x0; options = IPMOptions(tol = 1e-10, verbose = true))
   error drops below `theta_mu * μ`.
 - `max_iter = 3000`: maximum number of outer (barrier) iterations.
 - `max_time = Inf`: time limit in seconds.
+- `feasibility_max_iter = 200`: maximum regularized-Newton iterations of
+  the pre-barrier feasibility stage, run when the initial point violates
+  inequalities, bounds or equalities (`0` disables it — the smoothly
+  extended barrier then restores feasibility on its own).
 
 A solution is accepted as converged when `μ` is at (or below) `mu_min` and
 the primal feasibility and the scaled stationarity residual of the barrier

@@ -293,6 +293,11 @@ function _ipm_solve_inner!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
             ),
         )
     end
+    # feasibility stage for infeasible starts
+    if !_strictly_feasible_zone(m, x)
+        opts.verbose && println("feasibility stage: restoring feasibility")
+        _feasibility_stage!(m, x, opts)
+    end
     mu = opts.mu_init
     st = IPMState(m, x, mu)
     mu_ref = Ref(st.mu)
@@ -339,6 +344,141 @@ function _ipm_solve_inner!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
     return _final_result(m, st, :max_iter, opts.max_iter)
 end
 
+# Strict-feasibility test for the scalar parts of the model (the same
+# threshold the barrier uses to switch from its smooth extension to the
+# strict barriers): every inequality below -ε and every finite bound at a
+# distance above ε.
+function _strictly_feasible_zone(m::IPMModel, x::AbstractVector)
+    ε = 1e-6
+    for c in m.nlineqs
+        for ci in _vec(c(x))
+            ci <= -ε || return false
+        end
+    end
+    if m.linAineq !== nothing
+        for ci in m.linAineq * x .- m.linbineq
+            ci <= -ε || return false
+        end
+    end
+    @inbounds for i in 1:m.n
+        isfinite(m.xl[i]) && (x[i] - m.xl[i] <= ε) && return false
+        isfinite(m.xu[i]) && (m.xu[i] - x[i] <= ε) && return false
+    end
+    return true
+end
+
+# C¹ measure of the constraint violation at x: ½Σ max(c_I + ε, 0)² + ½Σ c_E²
+# + ½Σ bound-violation² (c_I in violation form, feasible ⇔ c_I ≤ 0). The
+# margin ε = 1e-2 keeps the landing point well inside the strict-barrier
+# zone: the barrier's initial multiplier μ/s (≈ μ/ε) stays moderate, so the
+# first barrier iterations are not pinned to the boundary (a landing
+# exactly on the boundary degenerates the barrier Hessian and stalls the
+# solver).
+function _violation_objective(m::IPMModel, x::AbstractVector)
+    ε = 1e-2
+    v = 0.0
+    for c in m.nlineqs
+        for ci in _vec(c(x))
+            ci + ε > 0 && (v += (ci + ε)^2 / 2)
+        end
+    end
+    if m.linAineq !== nothing
+        for ci in m.linAineq * x .- m.linbineq
+            ci + ε > 0 && (v += (ci + ε)^2 / 2)
+        end
+    end
+    for c in m.nleqs
+        v += sum(abs2, _vec(c(x))) / 2
+    end
+    if m.linAeq !== nothing
+        v += sum(abs2, m.linAeq * x .- m.linbeq) / 2
+    end
+    @inbounds for i in 1:m.n
+        if isfinite(m.xl[i]) && x[i] < m.xl[i] + ε
+            v += (m.xl[i] + ε - x[i])^2 / 2
+        end
+        if isfinite(m.xu[i]) && x[i] > m.xu[i] - ε
+            v += (x[i] - (m.xu[i] - ε))^2 / 2
+        end
+    end
+    return v
+end
+
+# Regularized Hessian operator of the violation objective (for MINRES):
+# (H + δI)u with H·u from AD Hessian-vector products.
+mutable struct ViolationHessianOp
+    f::Any
+    x::Vector{Float64}
+    δ::Float64
+    n::Int
+end
+Base.size(op::ViolationHessianOp) = (op.n, op.n)
+Base.size(op::ViolationHessianOp, d::Int) = size(op)[d]
+Base.eltype(::ViolationHessianOp) = Float64
+function LinearAlgebra.mul!(y, op::ViolationHessianOp, u)
+    fill!(y, 0.0)
+    hvp!(y, op.f, op.x, u)
+    y .+= op.δ .* u
+    return y
+end
+
+# Feasibility stage: run before the barrier iterations when the initial
+# point violates the inequalities, bounds or equalities. Minimizes the
+# constraint violation with a regularized Newton method (MINRES on H + δI,
+# Armijo backtracking on the violation objective) until the violation is
+# within the solver tolerance, or gives up after `feasibility_max_iter`
+# iterations (the C¹-extended barrier then continues from wherever the
+# stage left off).
+function _feasibility_stage!(m::IPMModel, x::Vector{Float64}, opts::IPMOptions)
+    opts.feasibility_max_iter > 0 || return nothing
+    _strictly_feasible_zone(m, x) && return nothing
+    f! = z -> _violation_objective(m, z)
+    xt = similar(x)
+    g = similar(x)
+    dx = similar(x)
+    for iter in 1:opts.feasibility_max_iter
+        m.counter[] += 1 + length(m.nlineqs) + length(m.nleqs)
+        _, gr = value_gradient(f!, x)
+        gr === nothing && return nothing
+        copyto!(g, gr)
+        # regularized Newton direction: (H + δI) dx = -g
+        δ = 1e-10
+        solved = false
+        for _ in 1:6
+            op = ViolationHessianOp(f!, x, δ, m.n)
+            sol, stats = Krylov.minres(
+                op, .-g; rtol=1e-8, atol=1e-12, itmax=max(2 * m.n, 100), verbose=0
+            )
+            if stats.solved
+                copyto!(dx, sol)
+                solved = true
+                break
+            end
+            δ *= 100.0
+        end
+        solved || return nothing
+        # Armijo backtracking on the violation objective
+        φ0 = f!(x)
+        α = 1.0
+        dφ = dot(g, dx)
+        accepted = false
+        while α > 1e-14
+            xt .= x .+ α .* dx
+            φ = f!(xt)
+            m.counter[] += 1 + length(m.nlineqs) + length(m.nleqs)
+            if φ <= φ0 + 1e-4 * α * dφ
+                accepted = true
+                break
+            end
+            α *= 0.5
+        end
+        accepted || return nothing
+        x .+= α .* dx
+        f!(x) <= 1e-12 && return nothing # all margins (1e-2) met
+    end
+    return nothing
+end
+
 function _ipm_solve!(m::IPMModel, opts::IPMOptions; x0::Vector{Float64}=m.x0)
     n = m.n
     mode = _solver_mode(m, opts)
@@ -363,6 +503,11 @@ function _ipm_solve!(m::IPMModel, opts::IPMOptions; x0::Vector{Float64}=m.x0)
                 "($(typeof(set))); IPMAlg requires a strictly feasible start for PSD constraints",
             ),
         )
+    end
+    # feasibility stage for infeasible starts (inequalities/bounds/equalities)
+    if !_strictly_feasible_zone(m, x)
+        opts.verbose && println("feasibility stage: restoring feasibility")
+        _feasibility_stage!(m, x, opts)
     end
     st = IPMState(m, x, opts.mu_init)
     xt = similar(x)

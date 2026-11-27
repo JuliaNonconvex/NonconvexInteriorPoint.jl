@@ -55,6 +55,25 @@ preconditioned MINRES when any matrix-free/trace-estimated constraint is
 present. `H` is applied through Hessian-vector products; with dense
 evaluation it is assembled by second-order AD of `φ_μ`.
 
+## Feasibility stage
+
+When the initial point violates the inequalities, bounds or equalities,
+`IPMAlg` first runs a **feasibility stage**: it minimizes the C¹ constraint
+violation
+
+```math
+½ Σ max(c_{I,i}(x) + ε, 0)² + ½ ‖c_E(x)‖² + ½ Σ (bound violations)²
+```
+
+with a regularized Newton method (MINRES on `H + δI`, Armijo backtracking)
+until every inequality and bound distance clears the margin `ε = 1e-2` —
+enough that the first barrier iterations are not pinned to the boundary.
+The stage budget is `feasibility_max_iter` (default 200, `0` disables it);
+whatever it cannot restore (e.g. a degenerate corner) is left to the C¹
+extended barrier of the main loop, so infeasible starts always make
+progress. PSD constraints still require a strictly feasible starting
+point.
+
 ## Line search
 
 Steps are taken with backtracking on the exact-penalty merit

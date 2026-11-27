@@ -16,6 +16,8 @@ Release notes for each version of the package.
     per-constraint barrier selection through `BarrierSelection` (labels,
     scalar barrier types `:log`/`:inv`/`:quad`, semidefinite barrier types
     `:logdet`/`:inverse`/`:inverse_square`).
+  - A pre-barrier feasibility stage (`feasibility_max_iter`) that restores
+    strict feasibility for infeasible starts before the barrier iterations.
   - Native linear constraints with cached constant Jacobians.
   - Regularized (inertia-corrected) KKT systems solved densely or
     matrix-free with Krylov methods.

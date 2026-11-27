@@ -39,6 +39,11 @@ NonconvexCore's label (`flags`) mechanism:
   formulation, and `inner = alg` to delegate the barrier subproblems to
   any NonconvexCore optimizer (the built-in Newton solver is the default).
 
+Infeasible initial points are handled automatically: a pre-barrier
+feasibility stage (`feasibility_max_iter`) restores strict feasibility
+before the barrier iterations, with the smoothly extended barrier as a
+fallback.
+
 Inequalities and set constraints enter the barrier with adjoint-only
 gradients (no Jacobians are materialized for them). The design is
 documented in [DESIGN.md](DESIGN.md).

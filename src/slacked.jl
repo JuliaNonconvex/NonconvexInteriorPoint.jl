@@ -476,6 +476,13 @@ function _ipm_solve_slacked!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
             ),
         )
     end
+    # feasibility stage for infeasible starts (the slacks absorb the
+    # inequality violations by construction, but the bounds and equalities
+    # still benefit from a pre-barrier feasibility push)
+    if !_strictly_feasible_zone(m, x)
+        opts.verbose && println("feasibility stage: restoring feasibility")
+        _feasibility_stage!(m, x, opts)
+    end
     cE0 = zeros(mE)
     cI0 = zeros(mI)
     eval_slacked_cons!(cE0, cI0, m, x)

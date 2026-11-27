@@ -139,6 +139,10 @@ Options for [`IPMAlg`](@ref), constructed with keyword arguments
 - `s_min::Real = 1e-8`: minimum slack/bound distance kept by
   fraction-to-the-boundary.
 - `max_time::Real = Inf`: time limit in seconds.
+- `feasibility_max_iter::Int = 200`: maximum regularized-Newton iterations
+  of the pre-barrier feasibility stage, which runs when the initial point
+  violates inequalities, bounds or equalities (set to `0` to disable it —
+  the smoothly extended barrier then restores feasibility on its own).
 - `verbose::Bool = false`: print iteration information.
 - `rng::Random.AbstractRNG = Random.default_rng()`: random number generator
   for the trace estimators.
@@ -172,6 +176,7 @@ struct IPMOptions
     tau::Float64
     s_min::Float64
     max_time::Float64
+    feasibility_max_iter::Int
     verbose::Bool
     rng::Random.AbstractRNG
 end
@@ -204,6 +209,7 @@ function IPMOptions(;
     tau::Real=0.995,
     s_min::Real=1e-8,
     max_time::Real=Inf,
+    feasibility_max_iter::Integer=200,
     verbose::Bool=false,
     rng::Random.AbstractRNG=Random.default_rng(),
 )
@@ -239,6 +245,7 @@ function IPMOptions(;
         Float64(tau),
         Float64(s_min),
         Float64(max_time),
+        Int(feasibility_max_iter),
         verbose,
         rng,
     )
