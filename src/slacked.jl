@@ -90,18 +90,27 @@ function slacked_barrier_value(
     φ = f - mu * (isempty(s) ? 0.0 : sum(log, s))
     ε = 1e-6
     # barriered inequality values
-    ineq_vals = vcat(
-        [_vec(c(x)) for (k, c) in enumerate(m.nlineqs) if m.nlineq_barrier[k]]...,
-        if (m.linAineq === nothing || !any(m.lin_ineq_barrier))
-            Float64[]
-        else
-            (v=m.linAineq * x .- m.linbineq; v[m.lin_ineq_barrier])
-        end,
-    )
+    ineq_vals = if m.jump !== nothing
+        jm = m.jump
+        g = zeros(jm.nineq + jm.neq)
+        NonconvexCore.jump_constraint_values!(jm, g, x)
+        rowsbar = ineq_barrier_rows(m)
+        g[findall(rowsbar)]
+    else
+        vcat(
+            [_vec(c(x)) for (k, c) in enumerate(m.nlineqs) if m.nlineq_barrier[k]]...,
+            if (m.linAineq === nothing || !any(m.lin_ineq_barrier))
+                Float64[]
+            else
+                (v=m.linAineq * x .- m.linbineq; v[m.lin_ineq_barrier])
+            end,
+        )
+    end
     bounds_feasible = true
     feasible = all(v -> v <= -ε, ineq_vals)
     if sel.box
         @inbounds for i in 1:m.n
+            m.fixed_bounds[i] && continue
             isfinite(m.xl[i]) &&
                 (x[i] - m.xl[i] <= ε && (bounds_feasible=false; feasible=false))
             isfinite(m.xu[i]) &&
@@ -115,6 +124,7 @@ function slacked_barrier_value(
         end
         if sel.box
             @inbounds for i in 1:m.n
+                m.fixed_bounds[i] && continue
                 if isfinite(m.xl[i])
                     d = x[i] - m.xl[i]
                     d <= 0 && return Inf
@@ -133,6 +143,7 @@ function slacked_barrier_value(
         end
         if sel.box
             @inbounds for i in 1:m.n
+                m.fixed_bounds[i] && continue
                 isfinite(m.xl[i]) && (φ += mu * _log_barrier_ext(x[i] - m.xl[i], ε))
                 isfinite(m.xu[i]) && (φ += mu * _log_barrier_ext(m.xu[i] - x[i], ε))
             end
@@ -246,6 +257,30 @@ end
 function eval_slacked_cons!(
     cE::AbstractVector, cI::AbstractVector, m::IPMModel, x::AbstractVector
 )
+    if m.jump !== nothing
+        # the evaluator computes every constraint value in one pass
+        jm = m.jump
+        g = zeros(jm.nineq + jm.neq)
+        NonconvexCore.jump_constraint_values!(jm, g, x)
+        copyto!(view(cE, 1:jm.neq), view(g, (jm.nineq + 1):(jm.nineq + jm.neq)))
+        rowsbar = ineq_barrier_rows(m)
+        rows = [i for i in 1:jm.nineq if !rowsbar[i]]
+        copyto!(view(cI, 1:length(rows)), view(g, rows))
+        offset = jm.neq + 1
+        if m.linAeq !== nothing
+            r = offset:(offset + size(m.linAeq, 1) - 1)
+            mul!(view(cE, r), m.linAeq, x)
+            view(cE, r) .-= m.linbeq
+        end
+        offset = length(rows) + 1
+        if m.linAineq !== nothing && any(.!m.lin_ineq_barrier)
+            mask = m.lin_ineq_barrier
+            v = m.linAineq * x .- m.linbineq
+            r = offset:(offset + count(!, mask) - 1)
+            copyto!(view(cI, r), v[.!mask])
+        end
+        return nothing
+    end
     # eq rows (all)
     offset = 1
     for c in m.nleqs
@@ -282,6 +317,36 @@ end
 # Assemble the dense Jacobian of the extended equality set:
 # rows [nl eq; lin eq; slacked nl ineq; slacked lin ineq].
 function assemble_slacked_jacobian!(st::SlackedState, m::IPMModel)
+    if m.jump !== nothing
+        # the evaluator's Jacobian in one pass, in the dense layout
+        # [equality rows; linear-eq rows; slacked ineq rows; linear ineq rows]
+        # that matches st.cE/st.cI and the λE/λI block split
+        jm = m.jump
+        J = Matrix(NonconvexCore.jump_jacobian(jm, st.x))
+        row = 1
+        neq = jm.neq
+        copyto!(
+            view(st.J, row:(row + neq - 1), :), view(J, (jm.nineq + 1):(jm.nineq + neq), :)
+        )
+        row += neq
+        if m.linAeq !== nothing
+            copyto!(view(st.J, row:(row + size(m.linAeq, 1) - 1), :), Matrix(m.linAeq))
+            row += size(m.linAeq, 1)
+        end
+        rowsbar = ineq_barrier_rows(m)
+        rows = [i for i in 1:jm.nineq if !rowsbar[i]]
+        for i in rows
+            copyto!(view(st.J, row, :), view(J, i, :))
+            row += 1
+        end
+        if m.linAineq !== nothing && any(.!m.lin_ineq_barrier)
+            mask = m.lin_ineq_barrier
+            As = m.linAineq[.!mask, :]
+            copyto!(view(st.J, row:(row + size(As, 1) - 1), :), Matrix(As))
+            row += size(As, 1)
+        end
+        return st.J
+    end
     row = 1
     for (k, c) in enumerate(m.nleqs)
         d = getdim(c)
@@ -401,15 +466,8 @@ function solve_slacked_kkt_dense!(
 )
     n = st.n
     δc = δc0
-    δw = 0.0
-    for trial in 1:12
-        assemble_slacked_kkt!(st, m, opts, δw, δc)
-        _scaled_eigen_kkt_solve!(st, n) && return true
-        δc *= 10.0
-    end
-    δc = 1e-4
-    δw = 1e-8
-    for trial in 1:12
+    δw = 1e-10
+    for trial in 1:14
         assemble_slacked_kkt!(st, m, opts, δw, δc)
         _scaled_eigen_kkt_solve!(st, n) && return true
         δc *= 10.0
@@ -611,7 +669,25 @@ function _ipm_solve_slacked!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
         ok = mode === :direct ? solve_slacked_kkt_dense!(st, m, opts) : true
         if mode === :krylov
             op = SlackedKKTOp(m, st, opts, 1e-10, 1e-8)
-            prec = KKTDiagPrecond(op.precond)
+            prec = if n + mE + mI <= 1500
+                H = if m.jump !== nothing
+                    _jump_slacked_lagrangian_hessian!(zeros(n, n), m, st.x, st.lamE, st.lamI)
+                else
+                    try
+                        value_hessian(_slacked_lagrangian(m, st.lamE, st.lamI), st.x)
+                    catch
+                        zeros(n, n)
+                    end
+                end
+                σx = _slacked_sigma_x(st, m, opts)
+                @inbounds for i in 1:n
+                    H[i, i] += σx[i] + 1e-10
+                end
+                bp = KKTBlockPrecond(H, view(op.precond, (n + 1):(n + mE + mI)), n)
+                bp === nothing ? KKTDiagPrecond(op.precond) : bp
+            else
+                KKTDiagPrecond(op.precond)
+            end
             sol, stats = Krylov.minres(
                 op,
                 st.rhs;
@@ -748,7 +824,12 @@ function _slacked_final_result(
             end
         end
         dual_inf = isempty(rstat) ? 0.0 : maximum(abs, rstat)
-        dual_proj = isempty(rstat) ? 0.0 : _projected_dual(m, st.x, rstat)
+        # the projected test uses the true objective gradient: the explicit
+        # multipliers in rstat and the barrier terms must not be
+        # double-counted by the NNLS
+        gf_true = zeros(m.n)
+        _objective_gradient(m, st.x, gf_true)
+        dual_proj = _projected_dual(m, st.x, gf_true)
         if primal_inf <= max(1000 * opts.tol, 1e-4) &&
             min(dual_inf, dual_proj) <= max(100 * opts.tol, 1e-4)
             status = :converged

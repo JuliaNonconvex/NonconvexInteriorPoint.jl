@@ -193,6 +193,129 @@ end
 # solver): evaluates the barrier, solves the KKT system, and takes a
 # backtracking step. Returns `(:ok, kkt_inf, primal_inf)` or
 # `(:fail, kkt_inf, primal_inf)`.
+# Constraint-violation measure for the filter: the 1-norm of the equality
+# residuals plus the positive-part sum of the inequalities plus the set
+# violations.
+function _filter_theta(m::IPMModel, x::AbstractVector)
+    cE = zeros(mE(m))
+    cI = zeros(mI(m))
+    eval_nonlinear_cons!(cE, cI, m, x)
+    eval_linear_cons!(cE, cI, m, x)
+    return sum(abs, cE) + sum(max.(cI, 0.0)) + _set_violation(m, x)
+end
+
+# Wächter–Biegler filter acceptance: a trial pair (θ, f) is acceptable if
+# it improves the violation or the objective by the margin γ against every
+# filter entry.
+function _filter_acceptable(
+    F::Vector{Tuple{Float64,Float64}}, θ::Float64, f::Float64, γ::Float64
+)
+    @inbounds for (θj, fj) in F
+        (θ <= (1 - γ) * θj || f <= fj - γ * θj) || return false
+    end
+    return true
+end
+
+# Filter backtracking on the Newton direction: return the accepted step
+# length (without moving the state); f-type steps (Armijo on the exact
+# penalty) leave the filter unchanged, θ-type steps augment it. On total
+# rejection, run the restoration phase (minimize the violation measure),
+# move the state to the restored point and return -1.0 as the sentinel for
+# "restoration accepted, no Newton step"; return 0.0 on failure.
+function _filter_backtrack!(m::IPMModel, st::IPMState, opts::IPMOptions, xt, dx)
+    γ = opts.filter_gamma
+    α = _bound_step(st.x, dx, m, opts)
+    while α > 1e-14
+        xt .= st.x .+ α .* dx
+        φt = barrier_objective(m, xt, st.mu, opts)
+        if isfinite(φt)
+            θt = _filter_theta(m, xt)
+            if _filter_acceptable(st.filter, θt, φt, γ)
+                # f-type if the exact-penalty Armijo also holds; otherwise a
+                # θ-type step that augments the filter with the margin pair
+                ν = max(1.0, maximum(abs, st.lamE; init=0.0) + 10.0)
+                φ0 = penalty_merit(m, st, st.x, opts; ν=ν)
+                dφ = dot(st.gf, dx) - ν * sum(abs, st.cE)
+                if !(φt + ν * θt <= φ0 + 1e-4 * α * dφ)
+                    push!(st.filter, ((1 - γ) * θt, φt - γ * θt))
+                end
+                return α
+            end
+        end
+        α *= 0.5
+    end
+    # restoration: minimize the violation measure from the current point
+    for _ in 1:opts.feasibility_max_iter
+        g = zeros(m.n)
+        if m.jump !== nothing
+            _jump_violation_gradient!(g, m, st.x)
+        else
+            _, gr = value_gradient(z -> _filter_theta(m, z), st.x)
+            gr === nothing && return 0.0
+            copyto!(g, gr)
+        end
+        solved = false
+        δ = 1e-10
+        if m.jump !== nothing && m.n <= 512
+            Hd = Matrix{Float64}(undef, m.n, m.n)
+            ei = zeros(m.n)
+            for j in 1:m.n
+                ei[j] = 1.0
+                _jump_violation_hessprod!(view(Hd, :, j), m, st.x, ei)
+                ei[j] = 0.0
+            end
+            for _ in 1:7
+                okd = try
+                    F = cholesky!(Symmetric(Hd) + δ * I)
+                    ldiv!(xt, F, .-g)
+                    true
+                catch
+                    false
+                end
+                if okd
+                    solved = true
+                    break
+                end
+                δ *= 100.0
+            end
+        end
+        if !solved
+            op = ViolationHessianOp(
+                m.jump === nothing ? (z -> _filter_theta(m, z)) : m, st.x, δ, m.n
+            )
+            sol, stats = Krylov.minres(
+                op, .-g; rtol=1e-8, atol=1e-12, itmax=max(4 * m.n, 200), verbose=0
+            )
+            if stats.solved
+                copyto!(xt, sol)
+                solved = true
+            end
+        end
+        solved || return 0.0
+        θ0 = _filter_theta(m, st.x)
+        dθ = dot(g, xt)
+        αr = 1.0
+        acceptedr = false
+        while αr > 1e-14
+            xr = st.x .+ αr .* xt
+            if _filter_theta(m, xr) <= θ0 + 1e-4 * αr * dθ
+                st.x .= xr
+                acceptedr = true
+                break
+            end
+            αr *= 0.5
+        end
+        acceptedr || return 0.0
+        θr = _filter_theta(m, st.x)
+        φr = barrier_objective(m, st.x, st.mu, opts)
+        if isfinite(φr) && _filter_acceptable(st.filter, θr, φr, γ)
+            push!(st.filter, ((1 - γ) * θr, φr - γ * θr))
+            return -1.0
+        end
+    end
+    return 0.0
+end
+
 function _newton_barrier_step!(
     m::IPMModel, st::IPMState, opts::IPMOptions, mode::Symbol, xt::Vector{Float64}
 )
@@ -234,6 +357,18 @@ function _newton_barrier_step!(
     ok || return (:fail, dual_inf, primal_inf)
     dx = _dx(st)
     dlam = _dlam(st)
+    # the Krylov solve has no inertia control: a converged MINRES solution
+    # of a wrong-inertia regularized system is not a merit-descent
+    # direction — detect it and re-solve with the dense factorization
+    if mode !== :direct
+        νchk = max(1.0, maximum(abs, st.lamE; init=0.0) + maximum(abs, dlam) + 10.0)
+        if dot(st.gf, dx) - νchk * sum(abs, st.cE) >= 0.0
+            ok = solve_kkt_dense!(st, m, opts)
+            ok || return (:fail, dual_inf, primal_inf)
+            dx = _dx(st)
+            dlam = _dlam(st)
+        end
+    end
 
     # --- backtracking line search on the exact-penalty merit ---
     α = _bound_step(st.x, dx, m, opts)
@@ -266,6 +401,16 @@ function _newton_barrier_step!(
         φ = penalty_merit(m, st, xt, opts; ν=ν)
         if isfinite(φ) && φ <= φ0 + 1e-3 * max(abs(φ0), 1.0)
             accepted = true
+        end
+    end
+    if !accepted && opts.line_search === :filter
+        αf = _filter_backtrack!(m, st, opts, xt, dx)
+        if αf == -1.0
+            accepted = true
+            α = 0.0
+        elseif αf > 1e-14
+            accepted = true
+            α = αf
         end
     end
     while !accepted && α > 1e-14
@@ -649,6 +794,13 @@ function _ipm_solve!(m::IPMModel, opts::IPMOptions; x0::Vector{Float64}=m.x0)
         _feasibility_stage!(m, x, opts)
     end
     st = IPMState(m, x, opts.mu_init)
+    if opts.line_search === :filter
+        # the filter ceiling is set by the initial violation: the first step
+        # may not increase θ beyond ~θ(x0), so the barrier path cannot run
+        # into gross infeasibility on the first Newton corrections
+        θ0 = _filter_theta(m, x)
+        st.filter[1] = (max(θ0 * (1 + 100 * opts.filter_gamma) + 1e-8, 1e-8), -Inf)
+    end
     xt = similar(x)
     nstall = 0
     fhist = fill(Inf, 5)
@@ -717,6 +869,19 @@ function _ipm_solve!(m::IPMModel, opts::IPMOptions; x0::Vector{Float64}=m.x0)
     return _final_result(m, st, :max_iter, opts.max_iter, opts)
 end
 
+# Objective gradient only (no barrier or multiplier terms).
+function _objective_gradient(m::IPMModel, x::AbstractVector, g::AbstractVector)
+    if m.jump !== nothing
+        gobj = similar(g)
+        NonconvexCore.jump_objective_gradient!(m.jump, gobj, x)
+        copyto!(g, gobj)
+    else
+        _, go = value_gradient(_aug_obj_closure(m), x)
+        go === nothing ? fill!(g, 0.0) : copyto!(g, go)
+    end
+    return g
+end
+
 # Full constraint Jacobian (all equality and inequality rows), dense.
 function _full_jacobian(m::IPMModel, x::AbstractVector)
     if m.jump !== nothing
@@ -736,17 +901,19 @@ function _full_jacobian(m::IPMModel, x::AbstractVector)
     return reduce(vcat, rows)
 end
 
-# Projected stationarity residual: min_δλ ‖r + P'δλ‖∞ with P = [J; E_a],
-# the constraint Jacobian plus the near-active bound rows. The residual
-# after the best adjustment of ALL adjustable multipliers: at points where
-# the active constraints (redundant/gauge rows, cost-piece definitions) or
-# near-active bounds make the multipliers non-unique, the raw residual can
-# stay large while the point itself is a KKT point — the projected measure
-# tests exactly that.
+# Projected stationarity residual: min_λ ‖∇f + P'λ‖∞ with P = [J; E_a],
+# the constraint Jacobian plus the near-active bound rows, subject to
+# λ ≥ 0 on the inequality and bound rows (the equality multipliers are
+# free). The nonnegative-least-squares residual is the correct testable
+# quantity: an unconstrained projection is vacuous when rank(J) = n (every
+# objective gradient is then representable, signs aside), and the sign
+# constraints are exactly what distinguishes a KKT point from an arbitrary
+# feasible point.
 function _projected_dual(m::IPMModel, x::AbstractVector, r::AbstractVector)
     J = _full_jacobian(m, x)
     rows = Matrix{Float64}[]
     push!(rows, J)
+    bndrows = Int[]
     for i in 1:m.n
         m.fixed_bounds[i] && continue
         if (isfinite(m.xl[i]) && x[i] - m.xl[i] <= 1e-8) ||
@@ -754,12 +921,31 @@ function _projected_dual(m::IPMModel, x::AbstractVector, r::AbstractVector)
             row = zeros(1, m.n)
             row[1, i] = 1.0
             push!(rows, row)
+            push!(bndrows, i)
         end
     end
     P = reduce(vcat, rows)
+    nineq = mI(m)
+    meq = size(J, 1) - nineq
+    nb = length(bndrows)
+    # lower bounds: ineq ≥ 0, eq free, near-active bounds ≥ 0
+    lb = vcat(fill(0.0, nineq), fill(-Inf, meq), fill(0.0, nb))
     G = P * P' + 1e-10 * I
-    δλ = G \ (P * r)
-    rp = r .- P' * δλ
+    b = P * r
+    λ = G \ b
+    active = λ .< lb
+    for _ in 1:10
+        any(active) || break
+        free = .!active
+        Gf = G[free, free]
+        λf = Gf \ (b[free] - G[free, active] * lb[active])
+        λ[free] .= λf
+        λ[active] .= lb[active]
+        activem = λ .< lb .- 1e-12
+        activem == active && break
+        active = activem
+    end
+    rp = r - P' * λ
     return maximum(abs, rp)
 end
 
@@ -778,7 +964,12 @@ function _final_result(
         rstat = copy(st.gf)
         _jteq_λ!(rstat, m, st.x, st.lamE)
         dual_inf = isempty(rstat) ? 0.0 : maximum(abs, rstat)
-        dual_proj = isempty(rstat) ? 0.0 : _projected_dual(m, st.x, rstat)
+        # the projected test uses the true objective gradient: the barrier
+        # terms in gf are implied multipliers that the NNLS must not
+        # double-count
+        gf_true = zeros(m.n)
+        _objective_gradient(m, st.x, gf_true)
+        dual_proj = _projected_dual(m, st.x, gf_true)
         if primal_inf <= 1000 * opts.tol &&
             min(dual_inf, dual_proj) <= max(100 * opts.tol, 1e-4)
             status = :converged

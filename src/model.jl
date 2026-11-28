@@ -541,6 +541,16 @@ function eval_nonlinear_cons!(
     cE::AbstractVector, cI::AbstractVector, m::IPMModel, x::AbstractVector
 )
     m.counter[] += length(m.nleqs) + length(m.nlineqs)
+    if m.jump !== nothing
+        # the evaluator computes every constraint value in one pass; the
+        # per-constraint closures re-enter the evaluator one row at a time
+        jm = m.jump
+        g = zeros(jm.nineq + jm.neq)
+        NonconvexCore.jump_constraint_values!(jm, g, x)
+        copyto!(view(cE, 1:jm.neq), view(g, (jm.nineq + 1):(jm.nineq + jm.neq)))
+        copyto!(view(cI, 1:jm.nineq), view(g, 1:jm.nineq))
+        return nothing
+    end
     offset = 1
     for c in m.nleqs
         v = _vec(c(x))

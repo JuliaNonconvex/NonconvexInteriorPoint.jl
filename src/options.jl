@@ -136,6 +136,11 @@ Options for [`IPMAlg`](@ref), constructed with keyword arguments
   into a quadratic penalty (relaxation).
 - `relaxed_penalty_rho::Real = 1e4`: penalty weight for relaxed constraints.
 - `tau::Real = 0.995`: fraction-to-the-boundary parameter.
+- `line_search::Symbol = :merit`: `:merit` (exact-penalty backtracking) or
+  `:filter` (Wächter–Biegler filter acceptance with feasibility
+  restoration).
+- `filter_gamma::Real = 1e-5`: the filter margin parameter (both the
+  θ- and the f-switching margins).
 - `s_min::Real = 1e-8`: minimum slack/bound distance kept by
   fraction-to-the-boundary.
 - `max_time::Real = Inf`: time limit in seconds.
@@ -175,6 +180,8 @@ struct IPMOptions
     relaxed_penalty_rho::Float64
     tau::Float64
     s_min::Float64
+    line_search::Symbol
+    filter_gamma::Float64
     max_time::Float64
     feasibility_max_iter::Int
     verbose::Bool
@@ -208,6 +215,8 @@ function IPMOptions(;
     relaxed_penalty_rho::Real=1e4,
     tau::Real=0.995,
     s_min::Real=1e-8,
+    line_search::Symbol=:merit,
+    filter_gamma::Real=1e-5,
     max_time::Real=Inf,
     feasibility_max_iter::Integer=200,
     verbose::Bool=false,
@@ -216,6 +225,8 @@ function IPMOptions(;
     linear_solver in (:auto, :direct, :krylov) ||
         throw(ArgumentError("linear_solver must be :auto, :direct or :krylov"))
     max_iter > 0 || throw(ArgumentError("max_iter must be positive"))
+    line_search in (:merit, :filter) ||
+        throw(ArgumentError("line_search must be :merit or :filter"))
     return IPMOptions(
         Float64(tol),
         Float64(mu_init),
@@ -244,6 +255,8 @@ function IPMOptions(;
         Float64(relaxed_penalty_rho),
         Float64(tau),
         Float64(s_min),
+        line_search,
+        Float64(filter_gamma),
         Float64(max_time),
         Int(feasibility_max_iter),
         verbose,

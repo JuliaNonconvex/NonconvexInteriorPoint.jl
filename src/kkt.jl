@@ -30,6 +30,7 @@ mutable struct IPMState
     setg::Vector{Vector{Float64}}
     mu::Float64
     last_E::Float64 # previous barrier KKT error (stagnation detection)
+    filter::Vector{Tuple{Float64,Float64}} # (θ, f) filter pairs (:filter line search)
     # buffers
     K::Matrix{Float64}
     rhs::Vector{Float64}
@@ -58,6 +59,7 @@ function IPMState(m::IPMModel, x::Vector{Float64}, mu::Float64)
         [zeros(n) for _ in m.setcons],
         mu,
         Inf,
+        [(1e8, -Inf)],
         zeros(N, N),
         zeros(N),
         zeros(N),
@@ -141,6 +143,70 @@ function barrier_objective(m::IPMModel, x::AbstractVector, mu::Float64, opts::IP
     return φ
 end
 
+# Evaluator-backed scalar barrier value (JuMP-converted models): identical
+# semantics to `_scalar_barrier_objective`, reading all constraint values
+# from the shared evaluator in one pass.
+function _jump_scalar_barrier_value(
+    m::IPMModel, x::AbstractVector, mu::Float64, opts::IPMOptions
+)
+    f = _aug_objective(m, x)
+    isfinite(f) || return Inf
+    sel = opts.barrier
+    φ = f
+    jm = m.jump
+    g = zeros(jm.nineq + jm.neq)
+    NonconvexCore.jump_constraint_values!(jm, g, x)
+    rowsbar = ineq_barrier_rows(m)
+    ε = 1e-6
+    feasible = true
+    @inbounds for i in 1:jm.nineq
+        rowsbar[i] && g[i] > -ε && (feasible = false)
+    end
+    if sel.box
+        @inbounds for i in 1:m.n
+            m.fixed_bounds[i] && continue
+            isfinite(m.xl[i]) && (x[i] - m.xl[i] <= ε && (feasible = false))
+            isfinite(m.xu[i]) && (m.xu[i] - x[i] <= ε && (feasible = false))
+        end
+    end
+    if m.strict[] || feasible
+        @inbounds for i in 1:jm.nineq
+            rowsbar[i] || continue
+            v = g[i]
+            v < 0 || return Inf
+            φ += _scalar_barrier(-v, mu, sel.ineq_type)
+        end
+        if sel.box
+            @inbounds for i in 1:m.n
+                m.fixed_bounds[i] && continue
+                if isfinite(m.xl[i])
+                    d = x[i] - m.xl[i]
+                    d <= 0 && return Inf
+                    φ += _scalar_barrier(d, mu, sel.box_type)
+                end
+                if isfinite(m.xu[i])
+                    d = m.xu[i] - x[i]
+                    d <= 0 && return Inf
+                    φ += _scalar_barrier(d, mu, sel.box_type)
+                end
+            end
+        end
+    else
+        @inbounds for i in 1:jm.nineq
+            rowsbar[i] || continue
+            φ += mu * _log_barrier_ext(-g[i], ε)
+        end
+        if sel.box
+            @inbounds for i in 1:m.n
+                m.fixed_bounds[i] && continue
+                isfinite(m.xl[i]) && (φ += mu * _log_barrier_ext(x[i] - m.xl[i], ε))
+                isfinite(m.xu[i]) && (φ += mu * _log_barrier_ext(m.xu[i] - x[i], ε))
+            end
+        end
+    end
+    return φ
+end
+
 # The scalar part of the barrier objective (objective, relaxed penalties,
 # inequality and bound barriers — no set barriers). Non-mutating and
 # AD-differentiable: used for the Hessian(-vector) products of the KKT
@@ -150,6 +216,10 @@ end
 function _scalar_barrier_objective(
     m::IPMModel, x::AbstractVector, mu::Float64, opts::IPMOptions
 )
+    if m.jump !== nothing
+        # the evaluator computes every constraint value in one pass
+        return _jump_scalar_barrier_value(m, x, mu, opts)
+    end
     f = _aug_objective(m, x)
     isfinite(f) || return Inf
     sel = opts.barrier
@@ -442,6 +512,18 @@ end
 
 # Assemble the dense equality Jacobian (rows: nl eq; lin eq).
 function assemble_jacobian!(st::IPMState, m::IPMModel)
+    if m.jump !== nothing
+        # the evaluator's Jacobian in one pass (the per-constraint
+        # value_jacobian closures re-enter the evaluator row by row)
+        jm = m.jump
+        Jeq = Matrix(NonconvexCore.jump_jacobian(jm, st.x)[(jm.nineq + 1):end, :])
+        copyto!(view(st.J, 1:size(Jeq, 1), :), Jeq)
+        if m.linAeq !== nothing
+            r = (size(Jeq, 1) + 1):(size(Jeq, 1) + size(m.linAeq, 1))
+            copyto!(view(st.J, r, :), Matrix(m.linAeq))
+        end
+        return st.J
+    end
     row = 1
     for (k, c) in enumerate(m.nleqs)
         d = getdim(c)
@@ -465,6 +547,73 @@ end
 # K → D⁻¹ᐟ² K D⁻¹ᐟ² (inertia-invariant) brings every block to unit scale,
 # where the eigen solve is numerically sound. Components with |λ| < 1e-14
 # are truncated (minimum-norm behavior on the near-singular directions).
+# Inertia of a Bunch–Kaufman LDLᵀ factorization from the pivot vector:
+# 1×1 pivots carry D on the diagonal; 2×2 pivots are recovered from the
+# block determinant and trace.
+function _ldl_inertia(A::Matrix{Float64}, ipiv::AbstractVector{<:Integer})
+    N = length(ipiv)
+    npos = 0
+    nneg = 0
+    nzero = 0
+    diagscale = 1.0
+    @inbounds for i in 1:N
+        diagscale = max(diagscale, abs(A[i, i]))
+    end
+    tol0 = 1e-12 * diagscale
+    k = 1
+    @inbounds while k <= N
+        if ipiv[k] > 0
+            d = A[k, k]
+            if d > tol0
+                npos += 1
+            elseif d < -tol0
+                nneg += 1
+            else
+                nzero += 1
+            end
+            k += 1
+        else
+            a = A[k, k]
+            b = A[k + 1, k]
+            c = A[k + 1, k + 1]
+            det = a * c - b * b
+            if det > 0
+                a + c > 0 ? (npos += 2) : (nneg += 2)
+            elseif det < 0
+                npos += 1
+                nneg += 1
+            else
+                nzero += 2
+            end
+            k += 2
+        end
+    end
+    return npos, nneg, nzero
+end
+
+# Magnitude range of the D-block diagonal entries of an LDLᵀ factorization
+# (the pivot-health measure for the back-solve).
+function _ldl_pivot_range(A::Matrix{Float64}, ipiv::AbstractVector{<:Integer})
+    N = length(ipiv)
+    pmin = Inf
+    pmax = 0.0
+    k = 1
+    @inbounds while k <= N
+        if ipiv[k] > 0
+            d = abs(A[k, k])
+            pmin = min(pmin, d)
+            pmax = max(pmax, d)
+            k += 1
+        else
+            d = max(abs(A[k, k]), abs(A[k + 1, k + 1]), abs(A[k + 1, k]))
+            pmin = min(pmin, d)
+            pmax = max(pmax, d)
+            k += 2
+        end
+    end
+    return pmin, pmax
+end
+
 function _scaled_eigen_kkt_solve!(st, n::Int)
     N = size(st.K, 1)
     s = Vector{Float64}(undef, N)
@@ -472,6 +621,25 @@ function _scaled_eigen_kkt_solve!(st, n::Int)
         s[i] = sqrt(max(abs(st.K[i, i]), 1e-20))
     end
     Ks = (st.K ./ s) ./ s'
+    # fast path: LDLᵀ with inertia from the factorization (the congruent
+    # scaling keeps every block at unit scale; the pivot range flags the
+    # near-singular directions where the plain back-solve would amplify)
+    F = copy(Ks)
+    Af, ipiv, info = LAPACK.sytrf!('U', F)
+    if info == 0
+        npos, _, nzero = _ldl_inertia(Af, ipiv)
+        if npos == n && nzero == 0
+            pmin, pmax = _ldl_pivot_range(Af, ipiv)
+            if pmin > 1e-10 * pmax
+                rhs_s = st.rhs ./ s
+                LAPACK.sytrs!('U', Af, ipiv, rhs_s)
+                st.sol .= rhs_s ./ s
+                return true
+            end
+        end
+    end
+    # degenerate fallback: eigen decomposition of the scaled system with
+    # the minimum-norm truncation on the noise-floor components
     E = eigen(Symmetric(Ks))
     npos = count(>(0.0), E.values)
     nzero = count(v -> abs(v) < 1e-14, E.values)
@@ -487,15 +655,12 @@ end
 function solve_kkt_dense!(st::IPMState, m::IPMModel, opts::IPMOptions; δc0::Float64=1e-8)
     n = st.n
     δc = δc0
-    δw = 0.0
-    for trial in 1:12
-        assemble_kkt_dense!(st, m, opts, δw, δc)
-        _scaled_eigen_kkt_solve!(st, n) && return true
-        δc *= 10.0
-    end
-    δc = 1e-4
-    δw = 1e-8
-    for trial in 1:12
+    # δw escalates together with δc: structural null directions in the
+    # barrier Hessian (variables without objective or constraint curvature)
+    # can only be regularized by δw, so a δc-only trial loop would reject
+    # the same inertia on every trial and burn an assembly per retry
+    δw = 1e-10
+    for trial in 1:14
         assemble_kkt_dense!(st, m, opts, δw, δc)
         _scaled_eigen_kkt_solve!(st, n) && return true
         δc *= 10.0
@@ -625,6 +790,45 @@ end
 Base.size(P::KKTDiagPrecond) = (length(P.d), length(P.d))
 Base.size(P::KKTDiagPrecond, d::Int) = size(P)[d]
 
+# Block preconditioner for the KKT MINRES: the (1,1) block is factorized
+# exactly (the barrier curvature dominates the ill-conditioning), the (2,2)
+# block keeps the diagonal approximation (λ/s scaling included).
+struct KKTBlockPrecond
+    F::Cholesky{Float64,Matrix{Float64}}
+    d2::Vector{Float64}
+    n::Int
+end
+
+function KKTBlockPrecond(H::Matrix{Float64}, d2::AbstractVector{Float64}, n::Int)
+    F = nothing
+    for shift in (1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 1.0)
+        F = try
+            cholesky(Symmetric(H) + shift * I)
+        catch
+            nothing
+        end
+        F === nothing || break
+    end
+    F === nothing && return nothing
+    return KKTBlockPrecond(F, d2, n)
+end
+
+function LinearAlgebra.ldiv!(y::AbstractVector, P::KKTBlockPrecond, x::AbstractVector)
+    n = P.n
+    copyto!(view(y, 1:n), P.F \ view(x, 1:n))
+    @inbounds for i in (n + 1):length(x)
+        y[i] = x[i] / P.d2[i - n]
+    end
+    return y
+end
+function LinearAlgebra.ldiv!(P::KKTBlockPrecond, x::AbstractVector)
+    y = P \ x
+    copyto!(x, y)
+    return x
+end
+Base.size(P::KKTBlockPrecond) = (P.n + length(P.d2), P.n + length(P.d2))
+Base.size(P::KKTBlockPrecond, d::Int) = size(P)[d]
+
 # Solve the KKT system with preconditioned MINRES, increasing the
 # regularization when the solve stalls.
 function solve_kkt_krylov!(st::IPMState, m::IPMModel, opts::IPMOptions)
@@ -632,7 +836,24 @@ function solve_kkt_krylov!(st::IPMState, m::IPMModel, opts::IPMOptions)
     δw = 1e-10
     for trial in 1:6
         op = KKTLinearOp(m, st, opts, δw, δc)
-        prec = KKTDiagPrecond(op.precond)
+        prec = if st.n + st.mE <= 1500
+            H = if m.jump !== nothing
+                _jump_barrier_hessian!(zeros(st.n, st.n), m, st.x, st.mu, opts)
+            else
+                try
+                    value_hessian(_barrier_closure(m, st.mu, opts), st.x)
+                catch
+                    zeros(st.n, st.n)
+                end
+            end
+            @inbounds for i in 1:st.n
+                H[i, i] += δw
+            end
+            bp = KKTBlockPrecond(H, view(op.precond, (st.n + 1):(st.n + st.mE)), st.n)
+            bp === nothing ? KKTDiagPrecond(op.precond) : bp
+        else
+            KKTDiagPrecond(op.precond)
+        end
         sol, stats = Krylov.minres(
             op,
             st.rhs;
