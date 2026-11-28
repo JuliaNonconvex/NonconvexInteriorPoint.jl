@@ -91,10 +91,22 @@ function slacked_barrier_value(
     # barriered inequality values
     ineq_vals = if m.jump !== nothing
         jm = m.jump
+        nji = m.n_jump_ineq
         g = zeros(jm.nineq + jm.neq)
         NonconvexCore.jump_constraint_values!(jm, g, x)
         rowsbar = ineq_barrier_rows(m)
-        g[findall(rowsbar)]
+        vcat(
+            g[findall(rowsbar)],
+            [
+                _vec(c(x)) for (k, c) in enumerate(m.nlineqs) if
+                (nji > 0 ? k > 1 : true) && m.nlineq_barrier[k]
+            ]...,
+            if (m.linAineq === nothing || !any(m.lin_ineq_barrier))
+                Float64[]
+            else
+                (v=m.linAineq * x .- m.linbineq; v[m.lin_ineq_barrier])
+            end,
+        )
     else
         vcat(
             [_vec(c(x)) for (k, c) in enumerate(m.nlineqs) if m.nlineq_barrier[k]]...,
@@ -231,6 +243,62 @@ end
 
 # Lagrangian closure over the equality constraints and the slacked
 # inequalities (their multipliers come from the extended equality set).
+# Whether the native slacked-Lagrangian part carries anything.
+function _has_native_slacked_lagrangian(m::IPMModel)
+    m.jump === nothing && return true
+    m.jump_obj || return true
+    !isempty(m.relaxed_eqs) && return true
+    !isempty(m.relaxed_ineqs) && return true
+    nji, nje = m.n_jump_ineq, m.n_jump_eq
+    for c in m.nleqs[(nje > 0 ? 2 : 1):end]
+        return true
+    end
+    for (k, c) in enumerate(m.nlineqs)
+        (nji > 0 ? k > 1 : true) && !m.nlineq_barrier[k] && return true
+    end
+    return false
+end
+
+# The native part of the slacked Lagrangian (mixed models): the objective
+# and relaxed penalties when not JuMP-backed, the native equality
+# multiplier terms, and the native slacked-inequality multiplier terms.
+# The λ vectors carry the JuMP rows first (λE: jump eq rows; λI: jump
+# slacked rows).
+function _native_slacked_lagrangian_value(
+    m::IPMModel, x::AbstractVector, lamE::AbstractVector, lamI::AbstractVector
+)
+    nji, nje = m.n_jump_ineq, m.n_jump_eq
+    L = if m.jump_obj
+        φ = 0.0
+        for c in m.relaxed_eqs
+            v = c(x)
+            φ += (m.rho / 2) * sum(abs2, v)
+        end
+        for c in m.relaxed_ineqs
+            v = c(x)
+            φ += (m.rho / 2) * sum(abs2, max.(v, 0.0))
+        end
+        φ
+    else
+        _aug_objective(m, x)
+    end
+    offsetE = nje + 1
+    for c in m.nleqs[(nje > 0 ? 2 : 1):end]
+        d = getdim(c)
+        L += dot(view(lamE, offsetE:(offsetE + d - 1)), _vec(c(x)))
+        offsetE += d
+    end
+    n_jump_sl = m.nlineq_barrier[1] ? 0 : nji
+    offsetI = n_jump_sl + 1
+    for (k, c) in enumerate(m.nlineqs)
+        (nji > 0 ? k > 1 : true) && !m.nlineq_barrier[k] || continue
+        d = getdim(c)
+        L += dot(view(lamI, offsetI:(offsetI + d - 1)), _vec(c(x)))
+        offsetI += d
+    end
+    return L
+end
+
 function _slacked_lagrangian(m::IPMModel, lamE::AbstractVector, lamI::AbstractVector)
     return function (x)
         L = _aug_objective(m, x)
@@ -257,21 +325,36 @@ function eval_slacked_cons!(
     cE::AbstractVector, cI::AbstractVector, m::IPMModel, x::AbstractVector
 )
     if m.jump !== nothing
-        # the evaluator computes every constraint value in one pass
+        # the evaluator computes the JuMP rows in one pass (they come first
+        # in the layout); the native rows follow through their closures
         jm = m.jump
+        nji, nje = m.n_jump_ineq, m.n_jump_eq
         g = zeros(jm.nineq + jm.neq)
         NonconvexCore.jump_constraint_values!(jm, g, x)
-        copyto!(view(cE, 1:jm.neq), view(g, (jm.nineq + 1):(jm.nineq + jm.neq)))
+        nje > 0 && copyto!(view(cE, 1:jm.neq), view(g, (jm.nineq + 1):(jm.nineq + jm.neq)))
         rowsbar = ineq_barrier_rows(m)
         rows = [i for i in 1:jm.nineq if !rowsbar[i]]
-        copyto!(view(cI, 1:length(rows)), view(g, rows))
-        offset = jm.neq + 1
+        nji > 0 && copyto!(view(cI, 1:length(rows)), view(g, rows))
+        offset = nje + 1
+        for c in m.nleqs[(nje > 0 ? 2 : 1):end]
+            v = _vec(c(x))
+            d = length(v)
+            copyto!(view(cE, offset:(offset + d - 1)), v)
+            offset += d
+        end
         if m.linAeq !== nothing
             r = offset:(offset + size(m.linAeq, 1) - 1)
             mul!(view(cE, r), m.linAeq, x)
             view(cE, r) .-= m.linbeq
         end
         offset = length(rows) + 1
+        for (k, c) in enumerate(m.nlineqs)
+            (nji > 0 ? k > 1 : true) && !m.nlineq_barrier[k] || continue
+            v = _vec(c(x))
+            d = length(v)
+            copyto!(view(cI, offset:(offset + d - 1)), v)
+            offset += d
+        end
         if m.linAineq !== nothing && any(.!m.lin_ineq_barrier)
             mask = m.lin_ineq_barrier
             v = m.linAineq * x .- m.linbineq
@@ -317,17 +400,28 @@ end
 # rows [nl eq; lin eq; slacked nl ineq; slacked lin ineq].
 function assemble_slacked_jacobian!(st::SlackedState, m::IPMModel)
     if m.jump !== nothing
-        # the evaluator's Jacobian in one pass, in the dense layout
-        # [equality rows; linear-eq rows; slacked ineq rows; linear ineq rows]
-        # that matches st.cE/st.cI and the λE/λI block split
+        # the evaluator's Jacobian in one pass for the JuMP rows (first in
+        # the layout), the native rows through their value_jacobian
+        # closures, in the dense layout [equality rows; linear-eq rows;
+        # slacked ineq rows; linear ineq rows] matching st.cE/st.cI and the
+        # λE/λI block split
         jm = m.jump
+        nji, nje = m.n_jump_ineq, m.n_jump_eq
         J = Matrix(NonconvexCore.jump_jacobian(jm, st.x))
         row = 1
-        neq = jm.neq
-        copyto!(
-            view(st.J, row:(row + neq - 1), :), view(J, (jm.nineq + 1):(jm.nineq + neq), :)
-        )
-        row += neq
+        if nje > 0
+            copyto!(
+                view(st.J, row:(row + jm.neq - 1), :),
+                view(J, (jm.nineq + 1):(jm.nineq + jm.neq), :),
+            )
+            row += jm.neq
+        end
+        for c in m.nleqs[(nje > 0 ? 2 : 1):end]
+            d = getdim(c)
+            _, Jc = value_jacobian(c, st.x)
+            copyto!(view(st.J, row:(row + d - 1), :), Jc)
+            row += d
+        end
         if m.linAeq !== nothing
             copyto!(view(st.J, row:(row + size(m.linAeq, 1) - 1), :), Matrix(m.linAeq))
             row += size(m.linAeq, 1)
@@ -337,6 +431,13 @@ function assemble_slacked_jacobian!(st::SlackedState, m::IPMModel)
         for i in rows
             copyto!(view(st.J, row, :), view(J, i, :))
             row += 1
+        end
+        for (k, c) in enumerate(m.nlineqs)
+            (nji > 0 ? k > 1 : true) && !m.nlineq_barrier[k] || continue
+            d = getdim(c)
+            _, Jc = value_jacobian(c, st.x)
+            copyto!(view(st.J, row:(row + d - 1), :), Jc)
+            row += d
         end
         if m.linAineq !== nothing && any(.!m.lin_ineq_barrier)
             mask = m.lin_ineq_barrier
@@ -468,7 +569,9 @@ function solve_slacked_kkt_dense!(
     δw = 1e-10
     for trial in 1:14
         assemble_slacked_kkt!(st, m, opts, δw, δc)
-        _scaled_eigen_kkt_solve!(st, n) && return true
+        if _scaled_eigen_kkt_solve!(st, n)
+            return true
+        end
         δc *= 10.0
         δw = max(δw * 100.0, 1e-4)
     end
@@ -596,6 +699,9 @@ function _ipm_solve_slacked!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
     end
     xt = similar(x)
     stt = similar(s)
+    nstall = 0
+    fhist = fill(Inf, 3)
+    prev_dual = Inf
 
     for iter in 1:opts.max_iter
         # --- evaluate ---
@@ -656,11 +762,19 @@ function _ipm_solve_slacked!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
         if st.mu <= opts.mu_min && primal_inf <= opts.tol && dual_inf <= opts.tol * scale
             return _slacked_final_result(m, st, :converged, iter, opts)
         end
-        # practical convergence once the barrier has essentially vanished
-        if st.mu <= 1e-5 &&
-            primal_inf <= opts.tol &&
-            dual_inf <= max(opts.tol * scale, 1e-4)
-            return _slacked_final_result(m, st, :converged, iter, opts)
+        # practical convergence once the barrier has essentially vanished:
+        # the projected (NNLS) stationarity covers degenerate active sets
+        # (cost-piece definitions) where the raw residual cannot shrink
+        if st.mu <= 1e-5 && primal_inf <= opts.tol
+            if dual_inf <= max(opts.tol * scale, 1e-4)
+                return _slacked_final_result(m, st, :converged, iter, opts)
+            end
+            gf_true = zeros(m.n)
+            _objective_gradient(m, st.x, gf_true)
+            dual_proj = _projected_dual(m, st.x, gf_true)
+            if dual_proj <= max(opts.tol * scale, 1e-4)
+                return _slacked_final_result(m, st, :converged, iter, opts)
+            end
         end
 
         # --- KKT solve ---
@@ -787,6 +901,21 @@ function _ipm_solve_slacked!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
         )
         if time() - t0 > opts.max_time
             return _slacked_final_result(m, st, :max_iter, iter, opts)
+        end
+        # global stall: at the terminal barrier, the state has stopped
+        # moving (frozen objective and residuals) — further iterations
+        # cannot improve anything; let _slacked_final_result apply the
+        # practical-convergence upgrade instead of burning max_iter
+        fhist[iter % 3 + 1] = st.f
+        fwindow = abs(st.f - fhist[(iter + 1) % 3 + 1]) <= 1e-8 * max(abs(st.f), 1.0)
+        if st.mu <= opts.mu_min
+            if fwindow && abs(dual_inf - prev_dual) <= 1e-8 * max(dual_inf, 1.0)
+                nstall += 1
+            else
+                nstall = 0
+            end
+            prev_dual = dual_inf
+            nstall >= 2 && return _slacked_final_result(m, st, :max_iter, iter, opts)
         end
     end
     return _slacked_final_result(m, st, :max_iter, opts.max_iter, opts)

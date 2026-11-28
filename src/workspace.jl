@@ -133,8 +133,18 @@ end
 # μ/s and the Hessian terms μ/s² explode).
 function _min_barrier_slack(m::IPMModel, x::AbstractVector, opts::IPMOptions)
     mins = Inf
+    nji = m.jump === nothing ? 0 : m.n_jump_ineq
+    if nji > 0 && m.nlineq_barrier[1]
+        # the JuMP inequality block: one evaluator pass
+        jm = m.jump
+        g = zeros(jm.nineq + jm.neq)
+        NonconvexCore.jump_constraint_values!(jm, g, x)
+        for i in 1:jm.nineq
+            mins = min(mins, -g[i])
+        end
+    end
     for (k, c) in enumerate(m.nlineqs)
-        m.nlineq_barrier[k] || continue
+        (nji > 0 ? k > 1 : true) && m.nlineq_barrier[k] || continue
         for v in _vec(c(x))
             mins = min(mins, -v)
         end
@@ -257,13 +267,7 @@ function _filter_backtrack!(m::IPMModel, st::IPMState, opts::IPMOptions, xt, dx)
         solved = false
         δ = 1e-10
         if m.jump !== nothing && m.n <= 512
-            Hd = Matrix{Float64}(undef, m.n, m.n)
-            ei = zeros(m.n)
-            for j in 1:m.n
-                ei[j] = 1.0
-                _jump_violation_hessprod!(view(Hd, :, j), m, st.x, ei)
-                ei[j] = 0.0
-            end
+            Hd = _jump_violation_hessian!(Matrix{Float64}(undef, m.n, m.n), m, st.x)
             for _ in 1:7
                 okd = try
                     F = cholesky!(Symmetric(Hd) + δ * I)
@@ -682,13 +686,7 @@ function _feasibility_stage!(m::IPMModel, x::Vector{Float64}, opts::IPMOptions)
         # applications per Newton step (each an evaluator Hessian product),
         # which dominates the stage cost on small models.
         if m.jump !== nothing && m.n <= 512
-            Hd = Matrix{Float64}(undef, m.n, m.n)
-            ei = zeros(m.n)
-            for j in 1:m.n
-                ei[j] = 1.0
-                _jump_violation_hessprod!(view(Hd, :, j), m, x, ei)
-                ei[j] = 0.0
-            end
+            Hd = _jump_violation_hessian!(Matrix{Float64}(undef, m.n, m.n), m, x)
             for retry in 1:7
                 okd = try
                     F = cholesky!(Symmetric(Hd) + δ * I)
@@ -871,10 +869,17 @@ end
 
 # Objective gradient only (no barrier or multiplier terms).
 function _objective_gradient(m::IPMModel, x::AbstractVector, g::AbstractVector)
-    if m.jump !== nothing
+    if m.jump !== nothing && m.jump_obj
         gobj = similar(g)
         NonconvexCore.jump_objective_gradient!(m.jump, gobj, x)
         copyto!(g, gobj)
+        # the evaluator objective excludes the relaxed-constraint penalties
+        for c in m.relaxed_eqs
+            jtprod!(g, c, x, m.rho .* c(x))
+        end
+        for c in m.relaxed_ineqs
+            jtprod!(g, c, x, m.rho .* max.(c(x), 0.0))
+        end
     else
         _, go = value_gradient(_aug_obj_closure(m), x)
         go === nothing ? fill!(g, 0.0) : copyto!(g, go)
@@ -883,21 +888,30 @@ function _objective_gradient(m::IPMModel, x::AbstractVector, g::AbstractVector)
 end
 
 # Full constraint Jacobian (all equality and inequality rows), dense.
+# The full constraint Jacobian in the row order [inequality rows;
+# equality rows] — the order the NNLS stationarity test expects (the
+# inequality multipliers carry the λ ≥ 0 sign constraint).
 function _full_jacobian(m::IPMModel, x::AbstractVector)
-    if m.jump !== nothing
-        return Matrix(NonconvexCore.jump_jacobian(m.jump, x))
-    end
+    nji, nje = m.jump === nothing ? (0, 0) : (m.n_jump_ineq, m.n_jump_eq)
     rows = Matrix{Float64}[]
-    for c in m.nleqs
+    if nji + nje > 0
+        Jj = Matrix(NonconvexCore.jump_jacobian(m.jump, x))
+        nji > 0 && push!(rows, Jj[1:m.jump.nineq, :])
+    end
+    for c in m.nlineqs[(nji > 0 ? 2 : 1):end]
         _, J = value_jacobian(c, x)
         push!(rows, Matrix(J))
     end
-    for c in m.nlineqs
+    m.linAineq !== nothing && push!(rows, Matrix(m.linAineq))
+    if nji + nje > 0
+        Jj = Matrix(NonconvexCore.jump_jacobian(m.jump, x))
+        nje > 0 && push!(rows, Jj[(m.jump.nineq + 1):end, :])
+    end
+    for c in m.nleqs[(nje > 0 ? 2 : 1):end]
         _, J = value_jacobian(c, x)
         push!(rows, Matrix(J))
     end
     m.linAeq !== nothing && push!(rows, Matrix(m.linAeq))
-    m.linAineq !== nothing && push!(rows, Matrix(m.linAineq))
     return reduce(vcat, rows)
 end
 

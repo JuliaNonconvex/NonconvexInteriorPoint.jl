@@ -25,16 +25,20 @@
     @test r_hy.minimizer ≈ r_bar.minimizer atol = 1e-5
     @test r_hy.minimizer ≈ r_sl.minimizer atol = 1e-5
 
-    # Row-index selection (one row of a vector inequality).
-    f3 = x -> [x[1]^2 + x[2] - 1.0, x[1] * x[2] - 0.2]
-    m2 = Model(x -> x[1]^2 + x[2]^2)
-    addvar!(m2, [-5.0, -5.0], [5.0, 5.0])
-    add_ineq_constraint!(m2, f3)
-    add_eq_constraint!(m2, x -> [x[1] + 2.0 * x[2] - 0.4])
-    r2 = optimize(m2, IPMAlg(), [1.0, 1.0]; options=IPMOptions(slacked_ineq_rows=[1]))
-    @test r2.status == :converged
-    @test r2.minimizer ≈ [0.08, 0.16] atol = 1e-4
-    r3 = optimize(m2, IPMAlg(), [1.0, 1.0]; options=IPMOptions(slacked_ineq_rows=[1, 2]))
-    @test r3.status == :converged
-    @test r3.minimizer ≈ [0.08, 0.16] atol = 1e-4
+    # JuMP-converted models: the whole inequality block carries a single
+    # label set through the conversion kwargs; selecting it slacks the
+    # block (matching slacks=true here, since every inequality is in it).
+    using JuMP
+    jm = JuMP.Model()
+    @variable(jm, -5.0 <= x[1:2] <= 5.0, start = 1.0)
+    @NLobjective(jm, Min, x[1]^2 + x[2]^2)
+    @NLconstraint(jm, x[1]^2 + x[2] - 1.0 <= 0)
+    @NLconstraint(jm, x[1] * x[2] - 0.2 <= 0)
+    @NLconstraint(jm, x[1] + 2.0 * x[2] - 0.4 == 0)
+    dm = NonconvexCore.DictModel(jm; ineq_flags=:slackme)
+    rj_hy = optimize(dm, IPMAlg(); options=IPMOptions(barrier=BarrierSelection(labels=:slackme)))
+    rj_sl = optimize(dm, IPMAlg(); options=IPMOptions(slacks=true))
+    @test rj_hy.status == :converged
+    @test rj_sl.status == :converged
+    @test collect(values(rj_hy.minimizer)) ≈ collect(values(rj_sl.minimizer)) atol = 1e-4
 end

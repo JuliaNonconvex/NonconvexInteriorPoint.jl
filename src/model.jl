@@ -53,9 +53,6 @@ mutable struct IPMModel
     linbeq::Union{Nothing,Vector{Float64}}
     linAineq::Union{Nothing,SparseMatrixCSC{Float64,Int}}
     linbineq::Union{Nothing,Vector{Float64}}
-    # inequality rows (1-based, JuMP evaluator row order) excluded from the
-    # barrier: they carry explicit slack/dual variables instead
-    slacked_ineq_rows::Set{Int}
     # barrier set constraints (PSDCone): (callable, set, mode)
     setcons::Vector{_SetCons}
     # relaxed constraints (quadratic penalty)
@@ -67,10 +64,19 @@ mutable struct IPMModel
     # points again (the smooth extension is only for infeasible starts)
     strict::Base.RefValue{Bool}
     counter::Base.RefValue{Int}
-    # The shared MathOptInterface evaluator of a JuMP-converted model
-    # (nothing otherwise): values, Jacobians and Lagrangian Hessians are
-    # read from it directly — the evaluator cannot be traced by AD.
+    # The shared MathOptInterface evaluator of the JuMP-converted part of
+    # the model (nothing otherwise): values, Jacobians and Lagrangian
+    # Hessians of the JuMP rows are read from it directly — the evaluator
+    # cannot be traced by AD. Mixed models (JuMP + native constraints) keep
+    # the evaluator for the JuMP rows and use AD for the native rows; the
+    # JuMP rows always come first in the constraint layout.
     jump::Union{Nothing,NonconvexCore.JuMPEvaluator}
+    # the objective is JuMP-backed (its gradient/Hessian come from the
+    # evaluator); the JuMP inequality rows are nlineqs[1] (n_jump_ineq of
+    # them), the JuMP equality rows are nleqs[1] (n_jump_eq of them)
+    jump_obj::Bool
+    n_jump_ineq::Int
+    n_jump_eq::Int
 end
 
 mE(m::IPMModel) = n_eq_nl(m) + n_eq_lin(m)
@@ -92,11 +98,6 @@ function ineq_barrier_rows(m::IPMModel)
         append!(rows, fill(m.nlineq_barrier[k], getdim(c)))
     end
     append!(rows, m.lin_ineq_barrier)
-    # row-level selection: the explicitly chosen rows get primal-dual
-    # treatment (slack and multiplier variables) instead of the barrier
-    for i in m.slacked_ineq_rows
-        (1 <= i <= length(rows)) && (rows[i] = false)
-    end
     return rows
 end
 
@@ -104,7 +105,6 @@ end
 function any_ineq_slacked(m::IPMModel)
     any(!, m.nlineq_barrier) && return true
     any(!, m.lin_ineq_barrier) && return true
-    !isempty(m.slacked_ineq_rows) && return true
     return false
 end
 
@@ -286,7 +286,7 @@ function build_ipm_model(m::AbstractModel, opts::IPMOptions)
     # A JuMP-converted model keeps its constraints in one shared MOI
     # evaluator: the linear-constancy probe must not split its rows (the
     # evaluator already handles affine rows in closed form).
-    jump = NonconvexCore.jump_evaluator(m)
+    jump = NonconvexCore.jump_evaluator(m) # the pure-model fast path probe
     n = length(getmin(m))
     xl = Float64.(getmin(m))
     xu = Float64.(getmax(m))
@@ -444,6 +444,53 @@ function build_ipm_model(m::AbstractModel, opts::IPMOptions)
         end
     end
 
+    # --- JuMP/native split for mixed models ---
+    # Every non-deprecated JuMP feature converts into at most one vector
+    # inequality and one vector equality constraint backed by one shared
+    # evaluator; native constraints may sit next to them. The evaluator
+    # fast path covers the JuMP rows (reordered to the front of each
+    # constraint block), the native rows keep the generic AD path.
+    _jump_of(f) = NonconvexCore._raw_jump_function(f)
+    objraw = objf === nothing ? nothing : _jump_of(getfunction(objf))
+    obj_jump_eval = objraw isa NonconvexCore.JuMPModelObjective ? objraw.m : nothing
+    jump_eval = obj_jump_eval
+    ineq_is_jump = Bool[]
+    for c in nlineqs
+        r = _jump_of(getfunction(c))
+        isj = r isa NonconvexCore.JuMPModelIneq
+        if isj && jump_eval === nothing
+            jump_eval = r.m
+        end
+        push!(ineq_is_jump, isj && r.m === jump_eval)
+    end
+    eq_is_jump = Bool[]
+    for c in nleqs
+        r = _jump_of(getfunction(c))
+        isj = r isa NonconvexCore.JuMPModelEq
+        if isj && jump_eval === nothing
+            jump_eval = r.m
+        end
+        push!(eq_is_jump, isj && r.m === jump_eval)
+    end
+    jump_obj = obj_jump_eval === jump_eval && jump_eval !== nothing
+    n_jump_ineq = 0
+    n_jump_eq = 0
+    if jump_eval !== nothing
+        # reorder: the JuMP constraints first in each block (with their
+        # modes and barrier masks)
+        ord_ineq = vcat(findall(ineq_is_jump), findall(.!ineq_is_jump))
+        ord_eq = vcat(findall(eq_is_jump), findall(.!eq_is_jump))
+        nlineqs = nlineqs[ord_ineq]
+        nlineq_modes = nlineq_modes[ord_ineq]
+        nlineq_barrier = nlineq_barrier[ord_ineq]
+        nleqs = nleqs[ord_eq]
+        nleq_modes = nleq_modes[ord_eq]
+        n_jump_ineq = sum(
+            getdim(c) for (c, b) in zip(nlineqs, ineq_is_jump[ord_ineq]) if b; init=0
+        )
+        n_jump_eq = sum(getdim(c) for (c, b) in zip(nleqs, eq_is_jump[ord_eq]) if b; init=0)
+    end
+
     # --- assemble sparse linear blocks ---
     # Fixed-variable pins (identity rows) close the equality block: they
     # must come last so cE, the Jacobian rows and the multipliers all agree.
@@ -482,14 +529,16 @@ function build_ipm_model(m::AbstractModel, opts::IPMOptions)
         linbeq,
         linAineq,
         linbineq,
-        Set(opts.slacked_ineq_rows === nothing ? Int[] : opts.slacked_ineq_rows),
         setcons,
         relaxed_eqs,
         relaxed_ineqs,
         Float64(opts.relaxed_penalty_rho),
         Ref(false),
         counter,
-        jump,
+        jump_eval,
+        jump_obj,
+        n_jump_ineq,
+        n_jump_eq,
     )
 end
 
@@ -551,25 +600,26 @@ function eval_nonlinear_cons!(
     cE::AbstractVector, cI::AbstractVector, m::IPMModel, x::AbstractVector
 )
     m.counter[] += length(m.nleqs) + length(m.nlineqs)
-    if m.jump !== nothing
-        # the evaluator computes every constraint value in one pass; the
-        # per-constraint closures re-enter the evaluator one row at a time
+    # the JuMP rows come first in the layout and are evaluated in one
+    # evaluator pass; the native rows (if any) follow through their
+    # per-constraint closures
+    nji, nje = m.jump === nothing ? (0, 0) : (m.n_jump_ineq, m.n_jump_eq)
+    if nji + nje > 0
         jm = m.jump
         g = zeros(jm.nineq + jm.neq)
         NonconvexCore.jump_constraint_values!(jm, g, x)
-        copyto!(view(cE, 1:jm.neq), view(g, (jm.nineq + 1):(jm.nineq + jm.neq)))
-        copyto!(view(cI, 1:jm.nineq), view(g, 1:jm.nineq))
-        return nothing
+        nje > 0 && copyto!(view(cE, 1:nje), view(g, (jm.nineq + 1):(jm.nineq + jm.neq)))
+        nji > 0 && copyto!(view(cI, 1:nji), view(g, 1:jm.nineq))
     end
-    offset = 1
-    for c in m.nleqs
+    offset = nje + 1
+    for c in m.nleqs[(nje > 0 ? 2 : 1):end]
         v = _vec(c(x))
         d = length(v)
         copyto!(view(cE, offset:(offset + d - 1)), v)
         offset += d
     end
-    offset = 1
-    for c in m.nlineqs
+    offset = nji + 1
+    for c in m.nlineqs[(nji > 0 ? 2 : 1):end]
         v = _vec(c(x))
         d = length(v)
         copyto!(view(cI, offset:(offset + d - 1)), v)

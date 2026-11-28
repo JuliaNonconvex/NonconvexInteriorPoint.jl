@@ -149,19 +149,50 @@ end
 function _jump_scalar_barrier_value(
     m::IPMModel, x::AbstractVector, mu::Float64, opts::IPMOptions
 )
-    f = _aug_objective(m, x)
-    isfinite(f) || return Inf
     sel = opts.barrier
-    φ = f
     jm = m.jump
+    nji = m.n_jump_ineq
+    # objective (and the relaxed penalties it carries): from the evaluator
+    # when JuMP-backed, otherwise the generic closure
+    φ = if m.jump_obj
+        f = m.obj === nothing ? 0.0 : Float64(m.obj(x))
+        isfinite(f) || return Inf
+        # the evaluator objective excludes the relaxed-constraint penalties
+        for c in m.relaxed_eqs
+            v = c(x)
+            f += (m.rho / 2) * sum(abs2, v)
+        end
+        for c in m.relaxed_ineqs
+            v = c(x)
+            f += (m.rho / 2) * sum(abs2, max.(v, 0.0))
+        end
+        f
+    else
+        f = _aug_objective(m, x)
+        isfinite(f) || return Inf
+        f
+    end
     g = zeros(jm.nineq + jm.neq)
     NonconvexCore.jump_constraint_values!(jm, g, x)
     rowsbar = ineq_barrier_rows(m)
+    # native inequality values (masked: barriered rows only)
+    native_vals = vcat(
+        [
+            _vec(c(x)) for (k, c) in enumerate(m.nlineqs) if
+            (nji > 0 ? k > 1 : true) && m.nlineq_barrier[k]
+        ]...,
+        if (m.linAineq === nothing || !any(m.lin_ineq_barrier))
+            Float64[]
+        else
+            (v=m.linAineq * x .- m.linbineq; v[m.lin_ineq_barrier])
+        end,
+    )
     ε = 1e-6
     feasible = true
     @inbounds for i in 1:jm.nineq
         rowsbar[i] && g[i] > -ε && (feasible = false)
     end
+    feasible &= all(v -> v <= -ε, native_vals)
     if sel.box
         @inbounds for i in 1:m.n
             m.fixed_bounds[i] && continue
@@ -173,6 +204,10 @@ function _jump_scalar_barrier_value(
         @inbounds for i in 1:jm.nineq
             rowsbar[i] || continue
             v = g[i]
+            v < 0 || return Inf
+            φ += _scalar_barrier(-v, mu, sel.ineq_type)
+        end
+        for v in native_vals
             v < 0 || return Inf
             φ += _scalar_barrier(-v, mu, sel.ineq_type)
         end
@@ -195,6 +230,9 @@ function _jump_scalar_barrier_value(
         @inbounds for i in 1:jm.nineq
             rowsbar[i] || continue
             φ += mu * _log_barrier_ext(-g[i], ε)
+        end
+        for v in native_vals
+            φ += mu * _log_barrier_ext(-v, ε)
         end
         if sel.box
             @inbounds for i in 1:m.n
@@ -512,20 +550,19 @@ end
 
 # Assemble the dense equality Jacobian (rows: nl eq; lin eq).
 function assemble_jacobian!(st::IPMState, m::IPMModel)
-    if m.jump !== nothing
-        # the evaluator's Jacobian in one pass (the per-constraint
-        # value_jacobian closures re-enter the evaluator row by row)
+    nji, nje = m.jump === nothing ? (0, 0) : (m.n_jump_ineq, m.n_jump_eq)
+    if nji + nje > 0
+        # the evaluator's Jacobian in one pass for the JuMP rows (which
+        # come first in the layout); the native rows follow through their
+        # per-constraint value_jacobian closures
         jm = m.jump
-        Jeq = Matrix(NonconvexCore.jump_jacobian(jm, st.x)[(jm.nineq + 1):end, :])
-        copyto!(view(st.J, 1:size(Jeq, 1), :), Jeq)
-        if m.linAeq !== nothing
-            r = (size(Jeq, 1) + 1):(size(Jeq, 1) + size(m.linAeq, 1))
-            copyto!(view(st.J, r, :), Matrix(m.linAeq))
-        end
-        return st.J
+        Jfull = Matrix(NonconvexCore.jump_jacobian(jm, st.x))
+        nje > 0 && copyto!(
+            view(st.J, 1:nje, :), view(Jfull, (jm.nineq + 1):(jm.nineq + jm.neq), :)
+        )
     end
-    row = 1
-    for (k, c) in enumerate(m.nleqs)
+    row = nje + 1
+    for c in m.nleqs[(nje > 0 ? 2 : 1):end]
         d = getdim(c)
         _, J = value_jacobian(c, st.x)
         copyto!(view(st.J, row:(row + d - 1), :), J)
