@@ -141,6 +141,15 @@ Options for [`IPMAlg`](@ref), constructed with keyword arguments
   restoration).
 - `filter_gamma::Real = 1e-5`: the filter margin parameter (both the
   θ- and the f-switching margins).
+- `slacked_ineq_rows::Union{Nothing,AbstractVector{Int}} = nothing`:
+  1-based inequality row indices (JuMP evaluator row order) excluded from
+  the barrier — they carry explicit slack and multiplier variables
+  (primal-dual treatment) while the remaining inequalities stay in the
+  barrier. Selects whole rows of the converted model; for Core models the
+  same selection is available per-constraint through
+  `BarrierSelection(labels = ...)` (constraints with matching flags are
+  slacked), and the whole inequality/equality block of a JuMP model can
+  be labeled via `NonconvexCore.DictModel(model; ineq_flags = ...)`.
 - `s_min::Real = 1e-8`: minimum slack/bound distance kept by
   fraction-to-the-boundary.
 - `max_time::Real = Inf`: time limit in seconds.
@@ -182,6 +191,7 @@ struct IPMOptions
     s_min::Float64
     line_search::Symbol
     filter_gamma::Float64
+    slacked_ineq_rows::Union{Nothing,AbstractVector{Int}}
     max_time::Float64
     feasibility_max_iter::Int
     verbose::Bool
@@ -217,6 +227,7 @@ function IPMOptions(;
     s_min::Real=1e-8,
     line_search::Symbol=:merit,
     filter_gamma::Real=1e-5,
+    slacked_ineq_rows=nothing,
     max_time::Real=Inf,
     feasibility_max_iter::Integer=200,
     verbose::Bool=false,
@@ -257,6 +268,7 @@ function IPMOptions(;
         Float64(s_min),
         line_search,
         Float64(filter_gamma),
+        slacked_ineq_rows === nothing ? nothing : collect(Int, slacked_ineq_rows),
         Float64(max_time),
         Int(feasibility_max_iter),
         verbose,

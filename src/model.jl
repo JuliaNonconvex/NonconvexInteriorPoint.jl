@@ -53,6 +53,9 @@ mutable struct IPMModel
     linbeq::Union{Nothing,Vector{Float64}}
     linAineq::Union{Nothing,SparseMatrixCSC{Float64,Int}}
     linbineq::Union{Nothing,Vector{Float64}}
+    # inequality rows (1-based, JuMP evaluator row order) excluded from the
+    # barrier: they carry explicit slack/dual variables instead
+    slacked_ineq_rows::Set{Int}
     # barrier set constraints (PSDCone): (callable, set, mode)
     setcons::Vector{_SetCons}
     # relaxed constraints (quadratic penalty)
@@ -89,6 +92,11 @@ function ineq_barrier_rows(m::IPMModel)
         append!(rows, fill(m.nlineq_barrier[k], getdim(c)))
     end
     append!(rows, m.lin_ineq_barrier)
+    # row-level selection: the explicitly chosen rows get primal-dual
+    # treatment (slack and multiplier variables) instead of the barrier
+    for i in m.slacked_ineq_rows
+        (1 <= i <= length(rows)) && (rows[i] = false)
+    end
     return rows
 end
 
@@ -96,6 +104,7 @@ end
 function any_ineq_slacked(m::IPMModel)
     any(!, m.nlineq_barrier) && return true
     any(!, m.lin_ineq_barrier) && return true
+    !isempty(m.slacked_ineq_rows) && return true
     return false
 end
 
@@ -473,6 +482,7 @@ function build_ipm_model(m::AbstractModel, opts::IPMOptions)
         linbeq,
         linAineq,
         linbineq,
+        Set(opts.slacked_ineq_rows === nothing ? Int[] : opts.slacked_ineq_rows),
         setcons,
         relaxed_eqs,
         relaxed_ineqs,

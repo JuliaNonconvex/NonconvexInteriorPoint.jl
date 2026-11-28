@@ -72,8 +72,7 @@ end
 _nl_slacked(m::IPMModel) = .!m.nlineq_barrier
 _lin_slacked(m::IPMModel) = .!m.lin_ineq_barrier
 function n_slacked_rows(m::IPMModel)
-    return sum(getdim(c) for (c, b) in zip(m.nlineqs, m.nlineq_barrier) if !b; init=0) +
-           count(!, m.lin_ineq_barrier)
+    return count(!, ineq_barrier_rows(m))
 end
 
 # ---------------------------------------------------------------------------
