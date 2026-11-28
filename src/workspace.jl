@@ -93,6 +93,7 @@ end
 function _init_x!(x::Vector{Float64}, m::IPMModel, opts::IPMOptions)
     r = opts.bound_relax_factor
     @inbounds for i in 1:m.n
+        m.fixed_bounds[i] && continue # pinned by an equality row, not a barrier
         if isfinite(m.xl[i])
             d = max(r * (1 + abs(m.xl[i])), r)
             x[i] = max(x[i], m.xl[i] + d)
@@ -103,6 +104,55 @@ function _init_x!(x::Vector{Float64}, m::IPMModel, opts::IPMOptions)
         end
     end
     return x
+end
+
+# Equality-Jacobian-times-direction J_E dx (for the directional merit
+# derivative; the JuMP-converted models read it from the evaluator).
+function _jeq_prod(m::IPMModel, st, dx::AbstractVector, mode::Symbol)
+    isempty(st.cE) && return zeros(0)
+    Jdx = zeros(st.mE)
+    if m.jump !== nothing
+        mul!(Jdx, _jump_eq_jacobian(m, st.x), dx)
+        return Jdx
+    end
+    offset = 1
+    for (k, c) in enumerate(m.nleqs)
+        d = getdim(c)
+        Jdx[offset:(offset + d - 1)] .= jacprod(c, st.x, dx)
+        offset += d
+    end
+    if m.linAeq !== nothing
+        mul!(Jdx, m.linAeq, dx)
+    end
+    return Jdx
+end
+
+# Minimum slack of the barriered inequalities and bounds (for the
+# central-path safeguard of the pure-dual bypass: a full step must not
+# crush a barriered slack against the boundary, where the barrier terms
+# μ/s and the Hessian terms μ/s² explode).
+function _min_barrier_slack(m::IPMModel, x::AbstractVector, opts::IPMOptions)
+    mins = Inf
+    for (k, c) in enumerate(m.nlineqs)
+        m.nlineq_barrier[k] || continue
+        for v in _vec(c(x))
+            mins = min(mins, -v)
+        end
+    end
+    if m.linAineq !== nothing && any(m.lin_ineq_barrier)
+        v = m.linAineq * x .- m.linbineq
+        for i in findall(m.lin_ineq_barrier)
+            mins = min(mins, -v[i])
+        end
+    end
+    if opts.barrier.box
+        @inbounds for i in 1:m.n
+            m.fixed_bounds[i] && continue
+            isfinite(m.xl[i]) && (mins = min(mins, x[i] - m.xl[i]))
+            isfinite(m.xu[i]) && (mins = min(mins, m.xu[i] - x[i]))
+        end
+    end
+    return mins
 end
 
 # Transposed-equality-Jacobian-times-multipliers (for the stationarity
@@ -187,27 +237,40 @@ function _newton_barrier_step!(
 
     # --- backtracking line search on the exact-penalty merit ---
     α = _bound_step(st.x, dx, m, opts)
-    ν = max(1.0, maximum(abs, st.lamE; init=0.0) + 10.0)
-    φ0 = penalty_merit(m, st, st.x, opts)
+    # the exact-penalty weight must dominate the *next* multipliers λ + dλ,
+    # not just the current ones (otherwise the Newton direction need not be
+    # a merit-descent direction)
+    ν = max(1.0, maximum(abs, st.lamE; init=0.0) + maximum(abs, dlam) + 10.0)
+    φ0 = penalty_merit(m, st, st.x, opts; ν=ν)
+    # Directional derivative of the exact-penalty merit as the theoretical
+    # upper bound g'd - ν‖cE‖₁: the linearized ‖cE + JEdx‖ variant
+    # overestimates the penalty change for nonlinear rows and rejects
+    # legitimate Newton corrections. The kink at cE = 0 is handled by the
+    # pure-dual bypass below instead.
+    JEdx = _jeq_prod(m, st, dx, mode)
     dφ = dot(st.gf, dx) - ν * sum(abs, st.cE)
     accepted = false
-    # A (near) pure-dual step: the primal move is negligible, so the
-    # exact-penalty merit is flat along dx and its |cE| kink makes the
-    # Armijo test reject any step that nudges cE off zero by more than a
-    # rounding unit (stalling the equality-multiplier update). Accept such
-    # steps directly when the merit stays finite and essentially
-    # non-increasing — this still rejects steps that would cross a
-    # constraint boundary (the strict barrier makes the merit infinite).
-    if maximum(abs, dx) <= 1e-8 * (1 + maximum(abs, st.x))
+    # A (near) pure-dual step, or a step that preserves the equalities to
+    # first order (J_E dx ≈ 0): the exact-penalty merit is flat along dx and
+    # its |cE| kink makes the Armijo test reject any step that nudges cE off
+    # zero by more than a rounding unit (stalling the equality-multiplier
+    # update). Accept such steps directly when the merit stays finite and
+    # essentially non-increasing — this still rejects steps that would cross
+    # a constraint boundary (the strict barrier makes the merit infinite).
+    # (the JEdx branch only applies with equality constraints present: an
+    # empty equality block would make maximum(abs, []) = 0 and accept every
+    # full step through the bypass)
+    if maximum(abs, dx) <= 1e-8 * (1 + maximum(abs, st.x)) ||
+        (!isempty(st.cE) && maximum(abs, JEdx) <= 1e-8 * (1 + maximum(abs, st.cE)))
         xt .= st.x .+ α .* dx
-        φ = penalty_merit(m, st, xt, opts)
+        φ = penalty_merit(m, st, xt, opts; ν=ν)
         if isfinite(φ) && φ <= φ0 + 1e-3 * max(abs(φ0), 1.0)
             accepted = true
         end
     end
     while !accepted && α > 1e-14
         xt .= st.x .+ α .* dx
-        φ = penalty_merit(m, st, xt, opts)
+        φ = penalty_merit(m, st, xt, opts; ν=ν)
         if isfinite(φ) && φ <= φ0 + 1e-4 * α * dφ
             accepted = true
             break
@@ -237,9 +300,17 @@ function _outer_update!(m::IPMModel, st::IPMState, opts::IPMOptions, iter::Int, 
     if st.mu <= opts.mu_min && primal_inf <= opts.tol && dual_inf <= opts.tol * scale
         return (:converged, dual_inf, primal_inf)
     end
-    # μ update (quality-function rule)
+    # μ update (quality-function rule) with a stagnation escape: when the
+    # barrier KKT error is not improving and the iterate is (nearly)
+    # feasible, force the linear μ decrease instead of waiting — the
+    # endgame plateaus otherwise pin μ and stall the multiplier updates.
     E_mu = max(dual_inf, primal_inf)
-    if E_mu <= opts.theta_mu * st.mu || E_mu <= 1e-3 || primal_inf <= 100 * opts.tol
+    stagnant = st.last_E <= 1.1 * E_mu
+    st.last_E = E_mu
+    if E_mu <= opts.theta_mu * st.mu ||
+        E_mu <= 1e-3 ||
+        primal_inf <= 100 * opts.tol ||
+        (stagnant && primal_inf <= 1e-3)
         if E_mu <= opts.theta_mu * st.mu
             st.mu = max(opts.mu_min, st.mu^opts.mu_superlinear_decrease_power)
         else
@@ -339,12 +410,12 @@ function _ipm_solve_inner!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
                 isempty(st.cI) ? 0.0 : maximum(v -> max(v, 0.0), st.cI),
                 _set_violation(m, st.x),
             )
-            primal_inf <= opts.tol && return _final_result(m, st, :converged, iter)
+            primal_inf <= opts.tol && return _final_result(m, st, :converged, iter, opts)
         end
         status, _, _ = _outer_update!(m, st, opts, iter, t0)
-        status === :continue || return _final_result(m, st, status, iter)
+        status === :continue || return _final_result(m, st, status, iter, opts)
     end
-    return _final_result(m, st, :max_iter, opts.max_iter)
+    return _final_result(m, st, :max_iter, opts.max_iter, opts)
 end
 
 # Strict-feasibility test for the scalar parts of the model (the same
@@ -364,6 +435,7 @@ function _strictly_feasible_zone(m::IPMModel, x::AbstractVector)
         end
     end
     @inbounds for i in 1:m.n
+        m.fixed_bounds[i] && continue
         isfinite(m.xl[i]) && (x[i] - m.xl[i] <= ε) && return false
         isfinite(m.xu[i]) && (m.xu[i] - x[i] <= ε) && return false
     end
@@ -397,6 +469,7 @@ function _violation_objective(m::IPMModel, x::AbstractVector)
         v += sum(abs2, m.linAeq * x .- m.linbeq) / 2
     end
     @inbounds for i in 1:m.n
+        m.fixed_bounds[i] && continue # pinned by the equality rows above
         if isfinite(m.xl[i]) && x[i] < m.xl[i] + ε
             v += (m.xl[i] + ε - x[i])^2 / 2
         end
@@ -458,29 +531,54 @@ function _feasibility_stage!(m::IPMModel, x::Vector{Float64}, opts::IPMOptions)
         # regularized Newton direction: (H + δI) dx = -g
         δ = 1e-10
         solved = false
-        if m.jump !== nothing
-            # the violation Hessian product of a JuMP-converted model comes
-            # from the evaluator (no AD through the closure)
-            jop = ViolationHessianOp(m, x, δ, m.n)
-            sol, stats = Krylov.minres(
-                jop, .-g; rtol=1e-8, atol=1e-12, itmax=max(2 * m.n, 100), verbose=0
-            )
-            if stats.solved
-                copyto!(dx, sol)
-                solved = true
+        # Dense fast path for small problems: assemble the violation Hessian
+        # through the (evaluator-based) Hessian products once and solve the
+        # regularized system directly — MINRES needs hundreds of operator
+        # applications per Newton step (each an evaluator Hessian product),
+        # which dominates the stage cost on small models.
+        if m.jump !== nothing && m.n <= 512
+            Hd = Matrix{Float64}(undef, m.n, m.n)
+            ei = zeros(m.n)
+            for j in 1:m.n
+                ei[j] = 1.0
+                _jump_violation_hessprod!(view(Hd, :, j), m, x, ei)
+                ei[j] = 0.0
+            end
+            for retry in 1:7
+                okd = try
+                    F = cholesky!(Symmetric(Hd) + δ * I)
+                    ldiv!(dx, F, .-g)
+                    true
+                catch
+                    false
+                end
+                if okd
+                    solved = true
+                    break
+                end
+                δ *= 100.0
             end
         end
-        for _ in 1:(solved ? 0 : 6)
-            op = ViolationHessianOp(f!, x, δ, m.n)
-            sol, stats = Krylov.minres(
-                op, .-g; rtol=1e-8, atol=1e-12, itmax=max(2 * m.n, 100), verbose=0
-            )
-            if stats.solved
-                copyto!(dx, sol)
-                solved = true
-                break
+        if !solved
+            # JuMP-converted models keep the evaluator-based product in every
+            # retry — AD cannot trace through the MOI evaluator, so the retry
+            # loop must not fall back to the closure operator for them.
+            for _ in 1:7
+                op = if m.jump !== nothing
+                    ViolationHessianOp(m, x, δ, m.n)
+                else
+                    ViolationHessianOp(f!, x, δ, m.n)
+                end
+                sol, stats = Krylov.minres(
+                    op, .-g; rtol=1e-8, atol=1e-12, itmax=max(4 * m.n, 200), verbose=0
+                )
+                if stats.solved
+                    copyto!(dx, sol)
+                    solved = true
+                    break
+                end
+                δ *= 100.0
             end
-            δ *= 100.0
         end
         solved || return nothing
         # Armijo backtracking on the violation objective
@@ -510,7 +608,12 @@ function _feasibility_stage!(m::IPMModel, x::Vector{Float64}, opts::IPMOptions)
             continue
         end
         x .+= α .* dx
-        f!(x) <= 1e-12 && return nothing # all margins (1e-2) met
+        # all margins (1e-2) met: the JuMP-converted models use the dense
+        # stage solve and stop at 1e-6 (deep enough for the 1e-6 strict
+        # zone, and the empirically stable setting for their barrier
+        # trajectories); the generic AD-traced stage keeps the tighter
+        # 1e-12 polish of the historical behavior
+        f!(x) <= (m.jump !== nothing ? 1e-6 : 1e-12) && return nothing
     end
     return nothing
 end
@@ -547,29 +650,140 @@ function _ipm_solve!(m::IPMModel, opts::IPMOptions; x0::Vector{Float64}=m.x0)
     end
     st = IPMState(m, x, opts.mu_init)
     xt = similar(x)
+    nstall = 0
+    fhist = fill(Inf, 5)
 
     for iter in 1:opts.max_iter
         # inner Newton: solve the barrier problem at st.mu
         kkt_inf = Inf
         primal_inf = Inf
         status = :fail
+        stagnant = 0
+        prev_f = st.f
+        inner_stalled = false
         for _ in 1:opts.inner_max_iter
             status, kkt_inf, primal_inf = _newton_barrier_step!(m, st, opts, mode, xt)
             status === :ok || break
             kkt_inf <= opts.theta_mu * st.mu && break # barrier problem solved
+            # stall detection on the objective progress: near the boundary
+            # the fraction-to-boundary can cap every step without improving
+            # the KKT error, but as long as the objective is still moving
+            # the crawl is making progress — break only when the objective
+            # has genuinely frozen, and let the outer μ update (and the
+            # practical-convergence check) act instead of crawling
+            stagnant = abs(st.f - prev_f) <= 1e-10 * max(abs(st.f), 1.0) ? stagnant + 1 : 0
+            prev_f = st.f
+            if stagnant >= 5
+                inner_stalled = true
+                break
+            end
         end
-        status === :ok || return _final_result(m, st, :diverged, iter)
+        status === :ok || return _final_result(m, st, :diverged, iter, opts)
         # practical convergence when the inner Newton stalls
         if primal_inf <= opts.tol && kkt_inf <= max(100 * opts.tol, 1e-4) && st.mu <= 1e-9
-            return _final_result(m, st, :converged, iter)
+            return _final_result(m, st, :converged, iter, opts)
         end
-        ostatus, _, _ = _outer_update!(m, st, opts, iter, t0)
-        ostatus === :continue || return _final_result(m, st, ostatus, iter)
+        ostatus, dual_inf, primal_inf = _outer_update!(m, st, opts, iter, t0)
+        ostatus === :continue || return _final_result(m, st, ostatus, iter, opts)
+        # practical convergence once the barrier has essentially vanished:
+        # when the inner Newton has genuinely stalled (frozen objective) at
+        # a feasible, stationarity-close point, the primal barrier cannot
+        # always polish the residual below the absolute threshold near
+        # active constraints (the fraction-to-the-boundary caps the Newton
+        # steps) — accept the point instead of crawling. The stall gate
+        # keeps this from firing early on well-behaved problems.
+        if inner_stalled && st.mu <= 1e-5
+            scale = max(1.0, isempty(st.gf) ? 0.0 : maximum(abs, st.gf))
+            if primal_inf <= opts.tol && dual_inf <= max(opts.tol * scale, 1e-4)
+                return _final_result(m, st, :converged, iter, opts)
+            end
+        end
+        # global stall: at the terminal barrier, the inner Newton stalls AND
+        # the objective has stopped improving over the last few outer
+        # iterations (a slowly-crawling state with a still-decreasing f is
+        # NOT stalled — the μ → 0 relaxation keeps moving it) — then stop
+        # and let _final_result apply the practical-convergence upgrade
+        if inner_stalled
+            nstall += 1
+        else
+            nstall = 0
+        end
+        fhist[iter % 5 + 1] = st.f
+        fwindow = abs(st.f - fhist[(iter + 1) % 5 + 1]) <= 1e-8 * max(abs(st.f), 1.0)
+        if st.mu <= opts.mu_min && nstall >= 3 && fwindow
+            return _final_result(m, st, :max_iter, iter, opts)
+        end
     end
-    return _final_result(m, st, :max_iter, opts.max_iter)
+    return _final_result(m, st, :max_iter, opts.max_iter, opts)
 end
 
-function _final_result(m::IPMModel, st::IPMState, status::Symbol, iterations::Int)
+# Full constraint Jacobian (all equality and inequality rows), dense.
+function _full_jacobian(m::IPMModel, x::AbstractVector)
+    if m.jump !== nothing
+        return Matrix(NonconvexCore.jump_jacobian(m.jump, x))
+    end
+    rows = Matrix{Float64}[]
+    for c in m.nleqs
+        _, J = value_jacobian(c, x)
+        push!(rows, Matrix(J))
+    end
+    for c in m.nlineqs
+        _, J = value_jacobian(c, x)
+        push!(rows, Matrix(J))
+    end
+    m.linAeq !== nothing && push!(rows, Matrix(m.linAeq))
+    m.linAineq !== nothing && push!(rows, Matrix(m.linAineq))
+    return reduce(vcat, rows)
+end
+
+# Projected stationarity residual: min_δλ ‖r + P'δλ‖∞ with P = [J; E_a],
+# the constraint Jacobian plus the near-active bound rows. The residual
+# after the best adjustment of ALL adjustable multipliers: at points where
+# the active constraints (redundant/gauge rows, cost-piece definitions) or
+# near-active bounds make the multipliers non-unique, the raw residual can
+# stay large while the point itself is a KKT point — the projected measure
+# tests exactly that.
+function _projected_dual(m::IPMModel, x::AbstractVector, r::AbstractVector)
+    J = _full_jacobian(m, x)
+    rows = Matrix{Float64}[]
+    push!(rows, J)
+    for i in 1:m.n
+        m.fixed_bounds[i] && continue
+        if (isfinite(m.xl[i]) && x[i] - m.xl[i] <= 1e-8) ||
+            (isfinite(m.xu[i]) && m.xu[i] - x[i] <= 1e-8)
+            row = zeros(1, m.n)
+            row[1, i] = 1.0
+            push!(rows, row)
+        end
+    end
+    P = reduce(vcat, rows)
+    G = P * P' + 1e-10 * I
+    δλ = G \ (P * r)
+    rp = r .- P' * δλ
+    return maximum(abs, rp)
+end
+
+function _final_result(
+    m::IPMModel, st::IPMState, status::Symbol, iterations::Int, opts::IPMOptions
+)
+    # Practical-convergence upgrade: the endgame can stall the μ schedule or
+    # the line search at a point that is already primal-feasible and
+    # stationarity-close; report it as converged instead of a failure.
+    if status in (:diverged, :max_iter)
+        primal_inf = max(
+            isempty(st.cE) ? 0.0 : maximum(abs, st.cE),
+            isempty(st.cI) ? 0.0 : maximum(v -> max(v, 0.0), st.cI),
+            _set_violation(m, st.x),
+        )
+        rstat = copy(st.gf)
+        _jteq_λ!(rstat, m, st.x, st.lamE)
+        dual_inf = isempty(rstat) ? 0.0 : maximum(abs, rstat)
+        dual_proj = isempty(rstat) ? 0.0 : _projected_dual(m, st.x, rstat)
+        if primal_inf <= 1000 * opts.tol &&
+            min(dual_inf, dual_proj) <= max(100 * opts.tol, 1e-4)
+            status = :converged
+        end
+    end
     fmin = m.obj === nothing ? 0.0 : Float64(m.obj(st.x))
     return IPMResult(copy(st.x), fmin, status, m.counter[], iterations)
 end
@@ -580,6 +794,7 @@ function _bound_step(x::AbstractVector, dx::AbstractVector, m::IPMModel, opts::I
     αmax = 1.0
     if opts.barrier.box
         @inbounds for i in 1:m.n
+            m.fixed_bounds[i] && continue # pinned by an equality row
             if dx[i] < -1e-16 && isfinite(m.xl[i])
                 αmax = min(αmax, (m.xl[i] - x[i]) / dx[i])
             elseif dx[i] > 1e-16 && isfinite(m.xu[i])

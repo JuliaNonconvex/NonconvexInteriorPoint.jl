@@ -29,6 +29,7 @@ mutable struct IPMState
     barvals::Vector{Float64}
     setg::Vector{Vector{Float64}}
     mu::Float64
+    last_E::Float64 # previous barrier KKT error (stagnation detection)
     # buffers
     K::Matrix{Float64}
     rhs::Vector{Float64}
@@ -56,6 +57,7 @@ function IPMState(m::IPMModel, x::Vector{Float64}, mu::Float64)
         fill(0.0, length(m.setcons)),
         [zeros(n) for _ in m.setcons],
         mu,
+        Inf,
         zeros(N, N),
         zeros(N),
         zeros(N),
@@ -166,6 +168,7 @@ function _scalar_barrier_objective(
     feasible = all(v -> v <= -ε, ineq_vals)
     if sel.box
         @inbounds for i in 1:m.n
+            m.fixed_bounds[i] && continue
             isfinite(m.xl[i]) && (x[i] - m.xl[i] <= ε && (feasible = false))
             isfinite(m.xu[i]) && (m.xu[i] - x[i] <= ε && (feasible = false))
         end
@@ -178,6 +181,7 @@ function _scalar_barrier_objective(
         end
         if sel.box
             @inbounds for i in 1:m.n
+                m.fixed_bounds[i] && continue
                 if isfinite(m.xl[i])
                     d = x[i] - m.xl[i]
                     d <= 0 && return Inf
@@ -197,6 +201,7 @@ function _scalar_barrier_objective(
         end
         if sel.box
             @inbounds for i in 1:m.n
+                m.fixed_bounds[i] && continue
                 if isfinite(m.xl[i])
                     φ += mu * _log_barrier_ext(x[i] - m.xl[i], ε)
                 end
@@ -212,14 +217,16 @@ end
 # Exact-penalty merit for the line search: the barrier objective plus an
 # ℓ₁ penalty on the equality-constraint violation (so the Newton direction
 # is a descent direction even when the objective is locally flat).
-function penalty_merit(m::IPMModel, st::IPMState, x::AbstractVector, opts::IPMOptions)
+function penalty_merit(
+    m::IPMModel, st::IPMState, x::AbstractVector, opts::IPMOptions; ν=nothing
+)
     φ = barrier_objective(m, x, st.mu, opts)
     isfinite(φ) || return Inf
     cE = zeros(st.mE)
     cI = zeros(st.mI)
     eval_nonlinear_cons!(cE, cI, m, x)
     eval_linear_cons!(cE, cI, m, x)
-    ν = max(1.0, maximum(abs, st.lamE; init=0.0) + 10.0)
+    ν = ν === nothing ? max(1.0, maximum(abs, st.lamE; init=0.0) + 10.0) : ν
     return φ + ν * sum(abs, cE)
 end
 
@@ -276,6 +283,7 @@ function barrier_objective_ext(
     end
     if sel.box
         @inbounds for i in 1:m.n
+            m.fixed_bounds[i] && continue
             if isfinite(m.xl[i])
                 t = x[i] - m.xl[i]
                 if t > ε
@@ -347,6 +355,7 @@ function barrier_gradient!(
     feasible = all(v -> v <= -ε, ineq_vals)
     if sel.box
         @inbounds for i in 1:m.n
+            m.fixed_bounds[i] && continue
             isfinite(m.xl[i]) && (x[i] - m.xl[i] <= ε && (feasible = false))
             isfinite(m.xu[i]) && (m.xu[i] - x[i] <= ε && (feasible = false))
         end
@@ -375,6 +384,7 @@ function barrier_gradient!(
     # bound barriers (diagonal, masked)
     if sel.box
         @inbounds for i in 1:m.n
+            m.fixed_bounds[i] && continue
             if isfinite(m.xl[i])
                 g[i] += _scalar_barrier_deriv(x[i] - m.xl[i], mu, sel.box_type)
             end
@@ -448,40 +458,46 @@ end
 
 # Solve the dense KKT system with the inertia-correction loop. Returns true
 # on success (and fills st.sol with (dx, dλE)).
+# One symmetric-diagonally-scaled eigen solve with inertia check on the
+# assembled KKT: the barrier curvature μ/s² near an active constraint makes
+# the raw KKT entries span ~1e14 relative to the objective blocks, which
+# destroys an unscaled eigendecomposition; the congruent scaling
+# K → D⁻¹ᐟ² K D⁻¹ᐟ² (inertia-invariant) brings every block to unit scale,
+# where the eigen solve is numerically sound. Components with |λ| < 1e-14
+# are truncated (minimum-norm behavior on the near-singular directions).
+function _scaled_eigen_kkt_solve!(st, n::Int)
+    N = size(st.K, 1)
+    s = Vector{Float64}(undef, N)
+    @inbounds for i in 1:N
+        s[i] = sqrt(max(abs(st.K[i, i]), 1e-20))
+    end
+    Ks = (st.K ./ s) ./ s'
+    E = eigen(Symmetric(Ks))
+    npos = count(>(0.0), E.values)
+    nzero = count(v -> abs(v) < 1e-14, E.values)
+    (npos == n && nzero == 0) || return false
+    y = E.vectors' * (st.rhs ./ s)
+    @inbounds for i in eachindex(y)
+        y[i] = abs(E.values[i]) < 1e-14 ? 0.0 : y[i] / E.values[i]
+    end
+    st.sol .= (E.vectors * y) ./ s
+    return true
+end
+
 function solve_kkt_dense!(st::IPMState, m::IPMModel, opts::IPMOptions; δc0::Float64=1e-8)
-    n, mE = st.n, st.mE
+    n = st.n
     δc = δc0
     δw = 0.0
     for trial in 1:12
         assemble_kkt_dense!(st, m, opts, δw, δc)
-        E = eigen(Symmetric(st.K))
-        copyto!(st.vals, E.values)
-        npos = count(>(0.0), st.vals)
-        nzero = count(v -> abs(v) < 1e-14, st.vals)
-        if npos == n && nzero == 0
-            copyto!(st.V, E.vectors)
-            _eigen_solve!(st.sol, st.V, st.vals, st.rhs)
-            return true
-        end
+        _scaled_eigen_kkt_solve!(st, n) && return true
         δc *= 10.0
     end
     δc = 1e-4
     δw = 1e-8
-    # Minimum acceptable curvature: the barrier Hessian can have structural
-    # null directions (variables without objective or barrier curvature at
-    # the current active set); they must be regularized, not amplified.
-    _kkt_min_curv = 1e-10
     for trial in 1:12
         assemble_kkt_dense!(st, m, opts, δw, δc)
-        E = eigen(Symmetric(st.K))
-        copyto!(st.vals, E.values)
-        npos = count(>(0.0), st.vals)
-        nzero = count(v -> abs(v) < 1e-14, st.vals)
-        if npos == n && nzero == 0
-            copyto!(st.V, E.vectors)
-            _eigen_solve!(st.sol, st.V, st.vals, st.rhs)
-            return true
-        end
+        _scaled_eigen_kkt_solve!(st, n) && return true
         δc *= 10.0
         δw = max(δw * 100.0, 1e-4)
     end

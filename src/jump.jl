@@ -66,6 +66,7 @@ function _jump_bound_curvature(
 )
     sel = opts.barrier
     cur = 0.0
+    m.fixed_bounds[i] && return cur # pinned by an equality row, no curvature
     if isfinite(m.xl[i])
         d = x[i] - m.xl[i]
         cur += if strict || d > 1e-6
@@ -105,6 +106,7 @@ function _jump_barrier_gradient!(
     feasible = all(i -> !(rowsbar[i] && gvals[i] > -ε), 1:nineq)
     if sel.box
         @inbounds for i in 1:m.n
+            m.fixed_bounds[i] && continue
             isfinite(m.xl[i]) && (x[i] - m.xl[i] <= ε && (feasible = false))
             isfinite(m.xu[i]) && (m.xu[i] - x[i] <= ε && (feasible = false))
         end
@@ -120,6 +122,7 @@ function _jump_barrier_gradient!(
     g .+= J' * w
     if sel.box
         @inbounds for i in 1:m.n
+            m.fixed_bounds[i] && continue
             if isfinite(m.xl[i])
                 d = x[i] - m.xl[i]
                 g[i] += strict ? _scalar_barrier_deriv(d, mu, sel.box_type) : -mu / ε
@@ -167,8 +170,10 @@ function _jump_barrier_hessian!(
         strict_b =
             m.strict[] || all(
                 i ->
-                    (!isfinite(m.xl[i]) || x[i] - m.xl[i] > ε) &&
-                    (!isfinite(m.xu[i]) || m.xu[i] - x[i] > ε),
+                    m.fixed_bounds[i] || (
+                        (!isfinite(m.xl[i]) || x[i] - m.xl[i] > ε) &&
+                        (!isfinite(m.xu[i]) || m.xu[i] - x[i] > ε)
+                    ),
                 1:n,
             )
         @inbounds for i in 1:n
@@ -218,8 +223,10 @@ function _jump_barrier_hessprod!(
         strict_b =
             m.strict[] || all(
                 i ->
-                    (!isfinite(m.xl[i]) || x[i] - m.xl[i] > ε) &&
-                    (!isfinite(m.xu[i]) || m.xu[i] - x[i] > ε),
+                    m.fixed_bounds[i] || (
+                        (!isfinite(m.xl[i]) || x[i] - m.xl[i] > ε) &&
+                        (!isfinite(m.xu[i]) || m.xu[i] - x[i] > ε)
+                    ),
                 1:n,
             )
         @inbounds for i in 1:n
@@ -301,14 +308,22 @@ function _jump_slacked_jacobian(m::IPMModel, x::AbstractVector)
     J = NonconvexCore.jump_jacobian(jm, x)
     rowsbar = ineq_barrier_rows(m)
     rows = [i for i in 1:jm.nineq if !rowsbar[i]]
-    return vcat(J[rows, :], J[(jm.nineq + 1):end, :])
+    Jsl = vcat(J[rows, :], J[(jm.nineq + 1):end, :])
+    if m.linAeq !== nothing # fixed-variable pins live in the linear block
+        Jsl = Jsl isa SparseMatrixCSC ? vcat(Jsl, m.linAeq) : vcat(Jsl, Matrix(m.linAeq))
+    end
+    return Jsl
 end
 
 # The equality rows of the shared evaluator's Jacobian (JuMP-converted
 # models): for the KKT operators' J_E blocks.
 function _jump_eq_jacobian(m::IPMModel, x::AbstractVector)
     jm = m.jump
-    return NonconvexCore.jump_jacobian(jm, x)[(jm.nineq + 1):end, :]
+    Jeq = NonconvexCore.jump_jacobian(jm, x)[(jm.nineq + 1):end, :]
+    if m.linAeq !== nothing # fixed-variable pins live in the linear block
+        Jeq = Jeq isa SparseMatrixCSC ? vcat(Jeq, m.linAeq) : vcat(Jeq, Matrix(m.linAeq))
+    end
+    return Jeq
 end
 
 # Equality-multiplier term g += J_E' λE for a JuMP-converted model (the
@@ -320,7 +335,11 @@ function _jump_jteq_λ!(
     isempty(lamE) && return r
     J = NonconvexCore.jump_jacobian(jm, x)
     Jeq = J[(jm.nineq + 1):end, :]
-    r .+= Jeq' * lamE
+    nln = size(Jeq, 1)
+    r .+= Jeq' * view(lamE, 1:nln)
+    if m.linAeq !== nothing # fixed-variable pins live in the linear block
+        r .+= m.linAeq' * view(lamE, (nln + 1):length(lamE))
+    end
     return r
 end
 
@@ -342,7 +361,11 @@ function _jump_violation_gradient!(g::AbstractVector, m::IPMModel, x::AbstractVe
     end
     J = NonconvexCore.jump_jacobian(jm, x)
     mul!(g, J', a)
+    if m.linAeq !== nothing # fixed-variable pins
+        mul!(g, m.linAeq', m.linAeq * x .- m.linbeq, 1.0, 1.0)
+    end
     @inbounds for i in 1:m.n
+        m.fixed_bounds[i] && continue
         if isfinite(m.xl[i]) && x[i] < m.xl[i] + ε
             g[i] -= m.xl[i] + ε - x[i]
         end
@@ -394,7 +417,11 @@ function _jump_violation_hessprod!(
             y[a] += J[i, a] * cdx[i]
         end
     end
+    if m.linAeq !== nothing # fixed-variable pins
+        mul!(y, m.linAeq', m.linAeq * dx, 1.0, 1.0)
+    end
     @inbounds for i in 1:n
+        m.fixed_bounds[i] && continue
         if isfinite(m.xl[i]) && x[i] < m.xl[i] + ε
             y[i] += dx[i]
         end

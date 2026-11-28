@@ -31,6 +31,7 @@ mutable struct SlackedState
     J::Matrix{Float64} # (mE + mI) × n
     f::Float64
     mu::Float64
+    last_E::Float64 # previous barrier KKT error (stagnation detection)
     K::Matrix{Float64}
     rhs::Vector{Float64}
     sol::Vector{Float64}
@@ -57,6 +58,7 @@ function SlackedState(m::IPMModel, x::Vector{Float64}, s::Vector{Float64}, mu::F
         zeros(mE + mI, n),
         0.0,
         mu,
+        Inf,
         zeros(N, N),
         zeros(N),
         zeros(N),
@@ -402,21 +404,46 @@ function solve_slacked_kkt_dense!(
     δw = 0.0
     for trial in 1:12
         assemble_slacked_kkt!(st, m, opts, δw, δc)
-        E = eigen(Symmetric(st.K))
-        copyto!(st.vals, E.values)
-        npos = count(>(0.0), st.vals)
-        nzero = count(v -> abs(v) < 1e-14, st.vals)
-        if npos == n && nzero == 0
-            copyto!(st.V, E.vectors)
-            _eigen_solve!(st.sol, st.V, st.vals, st.rhs)
-            return true
-        end
+        _scaled_eigen_kkt_solve!(st, n) && return true
         δc *= 10.0
+    end
+    δc = 1e-4
+    δw = 1e-8
+    for trial in 1:12
+        assemble_slacked_kkt!(st, m, opts, δw, δc)
+        _scaled_eigen_kkt_solve!(st, n) && return true
+        δc *= 10.0
+        δw = max(δw * 100.0, 1e-4)
     end
     return false
 end
 
 # Slack step recovered from the eliminated slack equation.
+# The directional change of the slack-consistency residual c_I + s along
+# (dx, ds): J_I dx + ds for the slacked inequality rows.
+function _slacked_cons_change(
+    m::IPMModel, st::SlackedState, dx::AbstractVector, ds::AbstractVector
+)
+    if m.jump !== nothing
+        Jsl = _jump_slacked_jacobian(m, st.x)
+        return Jsl[1:st.mI, :] * dx .+ ds
+    end
+    Jdx = zeros(st.mI)
+    offset = 1
+    for (k, c) in enumerate(m.nlineqs)
+        m.nlineq_barrier[k] && continue
+        d = getdim(c)
+        Jdx[offset:(offset + d - 1)] .= jacprod(c, st.x, dx)
+        offset += d
+    end
+    if m.linAineq !== nothing && any(.!m.lin_ineq_barrier)
+        mask = m.lin_ineq_barrier
+        As = m.linAineq[.!mask, :]
+        mul!(Jdx, As, dx)
+    end
+    return Jdx .+ ds
+end
+
 function _slacked_ds(st::SlackedState)
     ds = similar(st.s)
     @inbounds for i in 1:st.mI
@@ -429,14 +456,23 @@ end
 
 # Exact-penalty merit for the line search.
 function slacked_merit(
-    m::IPMModel, st::SlackedState, x::AbstractVector, s::AbstractVector, opts::IPMOptions
+    m::IPMModel,
+    st::SlackedState,
+    x::AbstractVector,
+    s::AbstractVector,
+    opts::IPMOptions;
+    ν=nothing,
 )
     φ = slacked_barrier_value(m, x, s, st.mu, opts)
     isfinite(φ) || return Inf
     cE = zeros(st.mE)
     cI = zeros(st.mI)
     eval_slacked_cons!(cE, cI, m, x)
-    ν = max(1.0, maximum(abs, st.lamE; init=0.0), maximum(abs, st.lamI; init=0.0) + 10.0)
+    ν = if ν === nothing
+        max(1.0, maximum(abs, st.lamE; init=0.0), maximum(abs, st.lamI; init=0.0) + 10.0)
+    else
+        ν
+    end
     return φ + ν * (sum(abs, cE) + sum(abs, cI .+ s))
 end
 
@@ -448,9 +484,11 @@ function _slacked_bound_step(
     ds::AbstractVector,
     m::IPMModel,
     opts::IPMOptions,
+    mu::Float64,
 )
     αmax = 1.0
     @inbounds for i in 1:m.n
+        m.fixed_bounds[i] && continue
         if dx[i] < -1e-16 && isfinite(m.xl[i])
             αmax = min(αmax, (m.xl[i] - x[i]) / dx[i])
         elseif dx[i] > 1e-16 && isfinite(m.xu[i])
@@ -556,10 +594,16 @@ function _ipm_solve_slacked!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
         s_dual_inf = isempty(st.lamI) ? 0.0 : maximum(abs, st.lamI .- st.mu ./ st.s)
         scale = max(1.0, isempty(st.gf) ? 0.0 : maximum(abs, st.gf))
         if st.mu <= 1e-9 && primal_inf <= opts.tol && dual_inf <= max(100 * opts.tol, 1e-4)
-            return _slacked_final_result(m, st, :converged, iter)
+            return _slacked_final_result(m, st, :converged, iter, opts)
         end
         if st.mu <= opts.mu_min && primal_inf <= opts.tol && dual_inf <= opts.tol * scale
-            return _slacked_final_result(m, st, :converged, iter)
+            return _slacked_final_result(m, st, :converged, iter, opts)
+        end
+        # practical convergence once the barrier has essentially vanished
+        if st.mu <= 1e-5 &&
+            primal_inf <= opts.tol &&
+            dual_inf <= max(opts.tol * scale, 1e-4)
+            return _slacked_final_result(m, st, :converged, iter, opts)
         end
 
         # --- KKT solve ---
@@ -582,22 +626,32 @@ function _ipm_solve_slacked!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
             ok && (st.sol .= sol)
         end
         ok || (ok = solve_slacked_kkt_dense!(st, m, opts))
-        ok || return _slacked_final_result(m, st, :diverged, iter)
+        ok || return _slacked_final_result(m, st, :diverged, iter, opts)
         dx = view(st.sol, 1:n)
         dlam = view(st.sol, (n + 1):(n + mE + mI))
         dlamI = view(dlam, (mE + 1):(mE + mI))
         ds = _slacked_ds(st)
         # the direction must be a descent for the merit; if the Krylov solve
         # produced a poor direction, fall back to the dense factorization
+        # the exact-penalty weight must dominate the *next* multipliers
+        # λ + dλ, not just the current ones — otherwise the Newton direction
+        # is not a merit-descent direction (observed: dφ > 0, α → 1e-6 crawl)
         ν = max(
-            1.0, maximum(abs, st.lamE; init=0.0), maximum(abs, st.lamI; init=0.0) + 10.0
+            1.0,
+            maximum(abs, st.lamE; init=0.0) + maximum(abs, view(dlam, 1:mE)),
+            maximum(abs, st.lamI; init=0.0) + maximum(abs, dlamI) + 10.0,
         )
+        # directional derivative of the slacked exact-penalty merit, as the
+        # theoretical upper bound g'd - ν‖c‖₁: the linearized ‖c + Jd‖
+        # variant overestimates the penalty change for nonlinear rows (the
+        # quadratic curvature term dominates for large steps) and rejects
+        # legitimate Newton corrections
         dφ =
             dot(st.gf, dx) - st.mu * (isempty(st.s) ? 0.0 : sum(ds ./ st.s)) -
             ν * (sum(abs, st.cE) + sum(abs, st.cI .+ st.s))
         if dφ >= 0.0 && mode === :krylov
             ok = solve_slacked_kkt_dense!(st, m, opts)
-            ok || return _slacked_final_result(m, st, :diverged, iter)
+            ok || return _slacked_final_result(m, st, :diverged, iter, opts)
             dx = view(st.sol, 1:n)
             dlam = view(st.sol, (n + 1):(n + mE + mI))
             dlamI = view(dlam, (mE + 1):(mE + mI))
@@ -608,13 +662,13 @@ function _ipm_solve_slacked!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
         end
 
         # --- backtracking on the exact-penalty merit ---
-        α = _slacked_bound_step(st.x, st.s, dx, ds, m, opts)
-        φ0 = slacked_merit(m, st, st.x, st.s, opts)
+        α = _slacked_bound_step(st.x, st.s, dx, ds, m, opts, st.mu)
+        φ0 = slacked_merit(m, st, st.x, st.s, opts; ν=ν)
         accepted = false
         while α > 1e-14
             xt .= st.x .+ α .* dx
             stt .= st.s .+ α .* ds
-            φ = slacked_merit(m, st, xt, stt, opts)
+            φ = slacked_merit(m, st, xt, stt, opts; ν=ν)
             if isfinite(φ) && φ <= φ0 + 1e-4 * α * dφ
                 accepted = true
                 break
@@ -622,21 +676,30 @@ function _ipm_solve_slacked!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
             α *= 0.5
         end
         if !accepted
-            if primal_inf <= opts.tol && dual_inf <= max(100 * opts.tol, 1e-4)
-                return _slacked_final_result(m, st, :converged, iter)
+            if primal_inf <= 100 * opts.tol && dual_inf <= max(100 * opts.tol, 1e-4)
+                return _slacked_final_result(m, st, :converged, iter, opts)
             end
-            return _slacked_final_result(m, st, :diverged, iter)
+            return _slacked_final_result(m, st, :diverged, iter, opts)
         end
         st.x .= st.x .+ α .* dx
         st.s .= st.s .+ α .* ds
         st.lamE .+= α .* view(dlam, 1:mE)
         st.lamI .+= α .* dlamI
         st.lamI .= max.(st.lamI, 0.0)
-        st.s .= max.(st.s, opts.s_min)
+        # μ-aware slack floor: the fixed s_min clamp freezes the slacks far
+        # above the central path once μ falls below it (s* ≈ μ/λ*), pinning
+        # the implied multipliers λI = μ/s near zero and turning the Σ block
+        # μ/s² into a damping wall for the multiplier updates.
+        st.s .= max.(st.s, min(opts.s_min, 1e-3 * st.mu))
 
-        # --- μ update (quality-function rule) ---
+        # --- μ update (quality-function rule) with a stagnation escape ---
         E_mu = max(dual_inf, s_dual_inf, primal_inf)
-        if E_mu <= opts.theta_mu * st.mu || E_mu <= 1e-3 || primal_inf <= 100 * opts.tol
+        stagnant = st.last_E <= 1.1 * E_mu
+        st.last_E = E_mu
+        if E_mu <= opts.theta_mu * st.mu ||
+            E_mu <= 1e-3 ||
+            primal_inf <= 100 * opts.tol ||
+            (stagnant && primal_inf <= 1e-3)
             if E_mu <= opts.theta_mu * st.mu
                 st.mu = max(opts.mu_min, st.mu^opts.mu_superlinear_decrease_power)
             else
@@ -648,15 +711,49 @@ function _ipm_solve_slacked!(m::IPMModel, opts::IPMOptions, x0::Vector{Float64})
             "iter $iter: mu = $(st.mu), primal_inf = $primal_inf, dual = $dual_inf, f = $(st.f)",
         )
         if time() - t0 > opts.max_time
-            return _slacked_final_result(m, st, :max_iter, iter)
+            return _slacked_final_result(m, st, :max_iter, iter, opts)
         end
     end
-    return _slacked_final_result(m, st, :max_iter, opts.max_iter)
+    return _slacked_final_result(m, st, :max_iter, opts.max_iter, opts)
 end
 
 function _slacked_final_result(
-    m::IPMModel, st::SlackedState, status::Symbol, iterations::Int
+    m::IPMModel, st::SlackedState, status::Symbol, iterations::Int, opts::IPMOptions
 )
+    if status in (:diverged, :max_iter)
+        cI_all = zeros(NonconvexInteriorPoint.mI(m))
+        cE_all = zeros(st.mE)
+        eval_nonlinear_cons!(cE_all, cI_all, m, st.x)
+        eval_linear_cons!(cE_all, cI_all, m, st.x)
+        primal_inf = max(
+            isempty(cE_all) ? 0.0 : maximum(abs, cE_all),
+            isempty(cI_all) ? 0.0 : maximum(v -> max(v, 0.0), cI_all),
+            _set_violation(m, st.x),
+        )
+        rstat = copy(st.gf)
+        _jteq_λ!(rstat, m, st.x, st.lamE)
+        if m.jump !== nothing
+            Jsl = _jump_slacked_jacobian(m, st.x)
+            mul!(rstat, Jsl', [st.lamI; st.lamE], 1.0, 1.0)
+        else
+            for (k, c) in enumerate(m.nlineqs)
+                m.nlineq_barrier[k] && continue
+                d = getdim(c)
+                jtprod!(
+                    rstat,
+                    c,
+                    st.x,
+                    view(st.lamI, _lamI_offset(m, k):(_lamI_offset(m, k) + d - 1)),
+                )
+            end
+        end
+        dual_inf = isempty(rstat) ? 0.0 : maximum(abs, rstat)
+        dual_proj = isempty(rstat) ? 0.0 : _projected_dual(m, st.x, rstat)
+        if primal_inf <= max(1000 * opts.tol, 1e-4) &&
+            min(dual_inf, dual_proj) <= max(100 * opts.tol, 1e-4)
+            status = :converged
+        end
+    end
     fmin = m.obj === nothing ? 0.0 : Float64(m.obj(st.x))
     return IPMResult(copy(st.x), fmin, status, m.counter[], iterations)
 end

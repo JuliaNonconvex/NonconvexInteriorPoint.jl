@@ -32,6 +32,10 @@ mutable struct IPMModel
     n::Int
     xl::Vector{Float64}
     xu::Vector{Float64}
+    # variables with xl == xu (fixed): they carry no bound barrier — a
+    # zero-width log barrier is infinite everywhere — and are instead
+    # pinned by identity rows appended to the linear equality block
+    fixed_bounds::BitVector
     x0::Vector{Float64}
     # objective (callable, or nothing for feasibility problems)
     obj::Any
@@ -68,6 +72,8 @@ end
 
 mE(m::IPMModel) = n_eq_nl(m) + n_eq_lin(m)
 mI(m::IPMModel) = n_ineq_nl(m) + n_ineq_lin(m)
+
+isfixed_bound(m::IPMModel, i::Integer) = m.fixed_bounds[i]
 
 # Numbers of equality/inequality rows (constraint functions may be
 # vector-valued).
@@ -283,6 +289,16 @@ function build_ipm_model(m::AbstractModel, opts::IPMOptions)
         isfinite(xl[i]) || (xl[i] = -1e4 * (1 + abs(x0v[i])))
         isfinite(xu[i]) || (xu[i] = 1e4 * (1 + abs(x0v[i])))
     end
+    # Fixed variables (xl == xu): no bound barrier is possible on a
+    # zero-width interval, so they are pinned by linear equality rows
+    # instead. The mask keeps every barrier/strict-feasibility/bound-step
+    # site from treating them as box barriers.
+    fixed_bounds = falses(n)
+    @inbounds for i in 1:n
+        if xl[i] == xu[i]
+            fixed_bounds[i] = true
+        end
+    end
     x0 = Float64.(getinit(m))
     counter = Ref(0)
 
@@ -420,6 +436,15 @@ function build_ipm_model(m::AbstractModel, opts::IPMOptions)
     end
 
     # --- assemble sparse linear blocks ---
+    # Fixed-variable pins (identity rows) close the equality block: they
+    # must come last so cE, the Jacobian rows and the multipliers all agree.
+    if any(fixed_bounds)
+        for i in findall(fixed_bounds)
+            row = spzeros(1, n)
+            row[1, i] = 1.0
+            push!(lin_eq_parts, (row, [xl[i]]))
+        end
+    end
     linAeq =
         isempty(lin_eq_parts) ? nothing : sparse(reduce(vcat, [p[1] for p in lin_eq_parts]))
     linbeq = isempty(lin_eq_parts) ? nothing : reduce(vcat, [p[2] for p in lin_eq_parts])
@@ -435,6 +460,7 @@ function build_ipm_model(m::AbstractModel, opts::IPMOptions)
         n,
         xl,
         xu,
+        fixed_bounds,
         x0,
         objf,
         nleqs,
